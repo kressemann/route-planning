@@ -93,3 +93,62 @@ def test_priority_gramm_before_stk_is_irrelevant_when_both_absent():
     # Kein Grammmuster, kein Stk. -> unklassifiziert, nicht faelschlich SCHNITTWARE.
     result = classify_article("Sonderposten X-42")
     assert result.article_class == UNKLASSIFIZIERT
+
+
+# -- Generische "Mix"-Regel (g) -----------------------------------------
+
+
+def test_generic_mix_chefs_mix():
+    result = classify_article("Chefs-Mix")
+    assert result.article_class == KOMPLETTE_VE
+    assert result.reason == "mix"
+
+
+def test_generic_mix_any_other_article_name():
+    result = classify_article("Bunter Salat Mix")
+    assert result.article_class == KOMPLETTE_VE
+    assert result.reason == "mix"
+
+
+def test_generic_mix_case_insensitive():
+    assert classify_article("CHEFS-MIX").article_class == KOMPLETTE_VE
+    assert classify_article("chefs-mix").article_class == KOMPLETTE_VE
+    assert classify_article("Chefs-MiX").article_class == KOMPLETTE_VE
+
+
+def test_mix_article_with_produktart_schnittware_stays_schnittware():
+    # Schnittware (b) hat Vorrang vor der generischen Mix-Regel (g).
+    result = classify_article("Irgendein Mix", produktart="Schnittware")
+    assert result.article_class == SCHNITTWARE
+    assert result.reason == "produktart"
+
+
+def test_mix_article_with_gramm_pattern_stays_schnittware():
+    # Schnittware (e) hat Vorrang vor der generischen Mix-Regel (g).
+    result = classify_article("Kraeuter Mix 200g")
+    assert result.article_class == SCHNITTWARE
+    assert result.reason == "gramm"
+
+
+def test_mix_article_with_stk_pattern_stays_schnittware():
+    # Schnittware (f) hat Vorrang vor der generischen Mix-Regel (g).
+    result = classify_article("Salat Mix Stk.")
+    assert result.article_class == SCHNITTWARE
+    assert result.reason == "stk"
+
+
+def test_mix_article_matching_1_9_pattern_stays_einzel_1_9():
+    # 1/9 (d) hat Vorrang vor der generischen Mix-Regel (g) - bestehendes
+    # Verhalten (siehe test_1_9_pattern) darf sich durch die neue Regel
+    # nicht aendern.
+    result = classify_article("Radieschen Mix 1/9")
+    assert result.article_class == EINZEL_1_9
+    assert result.reason == "1/9"
+
+
+def test_mix_override_still_beats_generic_mix_rule():
+    # Bestehende spezifische Overrides (a) fuer "Shira Mix"/"Sakina Mix"
+    # bleiben unveraendert - sie werden schon vorher getroffen.
+    result = classify_article("Shira Mix")
+    assert result.article_class == KOMPLETTE_VE
+    assert result.reason == "override"

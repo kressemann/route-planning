@@ -7,6 +7,7 @@ import io
 
 import pytest
 from openpyxl import load_workbook
+from pypdf import PdfReader
 
 from routeplanning.app import create_app
 from routeplanning.zoho import DELIVERABLE_STATUSES
@@ -236,3 +237,53 @@ def test_xlsx_download_reflects_manual_values(client):
     assert row2[0] == 1
     assert row2[2] == "Kunde A"
     assert row2[3] == 4  # manuell ueberschriebener Wert
+
+
+# -- PDF -----------------------------------------------------------------
+
+
+def test_pdf_download_content_type_and_filename(client):
+    client.post("/api/tour/load", json={"date": "2026-08-20"})
+    resp = client.get("/api/draft/2026-08-20/pdf")
+    assert resp.status_code == 200
+    assert resp.mimetype == "application/pdf"
+    assert 'filename="Lieferliste_2026-08-20.pdf"' in resp.headers["Content-Disposition"]
+
+
+def test_pdf_download_unknown_date_returns_404(client):
+    resp = client.get("/api/draft/2026-08-20/pdf")
+    assert resp.status_code == 404
+
+
+def test_delete_stop_does_not_appear_in_pdf(client):
+    client.post("/api/tour/load", json={"date": "2026-08-20"})
+    client.delete("/api/draft/2026-08-20/stops/c1")
+
+    resp = client.get("/api/draft/2026-08-20/pdf")
+    assert resp.status_code == 200
+    reader = PdfReader(io.BytesIO(resp.data))
+    text = reader.pages[0].extract_text()
+    assert "Kunde A" not in text
+    assert "Kunde B" in text
+
+
+def test_pdf_download_reflects_manual_values_and_order(client):
+    client.post("/api/tour/load", json={"date": "2026-08-20"})
+    client.put(
+        "/api/draft/2026-08-20",
+        json={
+            "stops": [
+                {"customer_id": "c2", "kisten": 0, "schnittware": 0, "kresse": 6},
+                {"customer_id": "c1", "kisten": 4, "schnittware": 0, "kresse": 0},
+            ]
+        },
+    )
+    resp = client.get("/api/draft/2026-08-20/pdf")
+    assert resp.status_code == 200
+
+    reader = PdfReader(io.BytesIO(resp.data))
+    text = reader.pages[0].extract_text()
+    assert "4" in text  # manuell ueberschriebener Kisten-Wert fuer Kunde A
+    assert "6" in text  # manuell ueberschriebener Kresse-Wert fuer Kunde B
+    # Reihenfolge aus dem Tourentwurf (c2 vor c1) muss uebernommen werden.
+    assert text.index("Kunde B") < text.index("Kunde A")

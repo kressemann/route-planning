@@ -85,6 +85,38 @@ def test_steige_counts_one_to_one_as_kisten():
     assert stops[0].kisten == 3  # 1 bestellte Steige = 1 Kiste, keine Rundung noetig
 
 
+def test_mix_article_one_unit_equals_one_kiste():
+    orders = [
+        _order("c1", "Kunde A", "NA-1", [_line("i1", "Chefs-Mix", 1)]),
+    ]
+    stops, warnings = build_stops(orders, no_produktart)
+    assert warnings == []
+    assert stops[0].kisten == 1
+
+
+def test_mix_article_multiple_units_equal_multiple_kisten():
+    orders = [
+        _order("c1", "Kunde A", "NA-1", [_line("i1", "Chefs-Mix", 3)]),
+    ]
+    stops, warnings = build_stops(orders, no_produktart)
+    assert warnings == []
+    assert stops[0].kisten == 3
+
+
+def test_mix_articles_from_different_line_items_sum_up():
+    orders = [
+        _order(
+            "c1",
+            "Kunde A",
+            "NA-1",
+            [_line("i1", "Chefs-Mix", 2), _line("i2", "Bunter Salat Mix", 1)],
+        ),
+    ]
+    stops, warnings = build_stops(orders, no_produktart)
+    assert warnings == []
+    assert stops[0].kisten == 3
+
+
 def test_einzel_1_9_and_komplette_ve_combine_in_kisten():
     orders = [
         _order(

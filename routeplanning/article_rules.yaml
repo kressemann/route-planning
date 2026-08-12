@@ -7,7 +7,12 @@
 #   d) "1/9" im Namen                    -> EINZEL_1_9   (1 Kiste = 9 Stk.)
 #   e) Grammangabe im Namen (z.B. "200g") -> SCHNITTWARE
 #   f) "Stk." im Namen                   -> SCHNITTWARE
-#   g) sonst                             -> UNKLASSIFIZIERT
+#   g) "Mix" im Namen                    -> KOMPLETTE_VE (9 Stk. je VE, 1
+#                                            bestellte Einheit = 1 Kiste).
+#                                            Schnittware (b, e, f) sowie
+#                                            Kresse (c) und 1/9 (d) haben
+#                                            Vorrang, falls beides zutrifft.
+#   h) sonst                             -> UNKLASSIFIZIERT
 #
 # Overrides matchen als Teilstring, gross-/kleinschreibungsunabhaengig, gegen
 # den Artikelnamen. Sie werden vor allen anderen Regeln geprueft.

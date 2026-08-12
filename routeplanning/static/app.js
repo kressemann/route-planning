@@ -15,6 +15,7 @@ const el = {
   profileName: document.getElementById("profile-name"),
   btnSaveProfile: document.getElementById("btn-save-profile"),
   btnDownloadXlsx: document.getElementById("btn-download-xlsx"),
+  btnDownloadPdf: document.getElementById("btn-download-pdf"),
   warnings: document.getElementById("warnings"),
   warningsList: document.getElementById("warnings-list"),
   emptyHint: document.getElementById("empty-hint"),
@@ -470,10 +471,19 @@ function downloadXlsx() {
   window.location.href = `${API_PREFIX}/api/draft/${state.date}/xlsx`;
 }
 
+function downloadPdf() {
+  if (!state.date) {
+    setStatus("Bitte zuerst eine Tour laden.", true);
+    return;
+  }
+  window.location.href = `${API_PREFIX}/api/draft/${state.date}/pdf`;
+}
+
 el.btnLoadTour.addEventListener("click", loadTour);
 el.btnLoadProfile.addEventListener("click", loadProfile);
 el.btnSaveProfile.addEventListener("click", saveProfile);
 el.btnDownloadXlsx.addEventListener("click", downloadXlsx);
+el.btnDownloadPdf.addEventListener("click", downloadPdf);
 el.btnGsmtasksTransfer.addEventListener("click", openGsmtasksModal);
 el.btnGsmtasksCancel.addEventListener("click", () => el.gsmtasksModal.close());
 el.btnGsmtasksConfirm.addEventListener("click", confirmGsmtasksTransfer);

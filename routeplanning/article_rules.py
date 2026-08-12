@@ -1,7 +1,7 @@
 """Klassifizierung von Zoho-Auftragspositionen in Verpackungsklassen.
 
 Die Regeln selbst stehen in ``article_rules.yaml``; dieses Modul wendet sie
-nur an. Reihenfolge und Bedeutung der Prioritaetsstufen a-g sind in der
+nur an. Reihenfolge und Bedeutung der Prioritaetsstufen a-h sind in der
 Aufgabenstellung festgelegt und in der YAML-Datei dokumentiert.
 """
 
@@ -85,5 +85,13 @@ def classify_article(
     if _STK_PATTERN.search(lname):
         return Classification(SCHNITTWARE, "stk")
 
-    # g) sonst unklassifiziert
+    # g) "Mix" im Namen -> KOMPLETTE_VE (9 Stk. je VE, 1 bestellte Einheit =
+    #    1 Kiste). Bewusst nach allen Schnittware-Regeln (b, e, f) sowie nach
+    #    Kresse (c) und 1/9 (d) geprueft, damit diese spezifischeren Regeln
+    #    Vorrang behalten, falls ein Artikelname zufaellig beides matcht (z.B.
+    #    "Radieschen Mix 1/9" bleibt EINZEL_1_9, nicht KOMPLETTE_VE).
+    if "mix" in lname:
+        return Classification(KOMPLETTE_VE, "mix")
+
+    # h) sonst unklassifiziert
     return Classification(UNKLASSIFIZIERT, "keine_regel_getroffen")

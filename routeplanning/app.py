@@ -16,6 +16,7 @@ from flask import Flask, Response, g, jsonify, render_template, request
 
 from . import db
 from .gsmtasks import DropoffTask, GSMtasksClient, GSMtasksError, build_description, build_external_id
+from .pdf_export import build_pdf
 from .quantities import build_stops, produktart_from_item
 from .xlsx_export import build_workbook, workbook_to_bytes
 from .zoho import ZohoError, ZohoInventory
@@ -232,6 +233,22 @@ def create_app(
         return Response(
             data,
             mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        )
+
+    @app.get("/api/draft/<delivery_date>/pdf")
+    @handle_errors
+    def download_pdf(delivery_date: str) -> Response:
+        _parse_date(delivery_date)
+        draft = db.get_draft(get_db(), delivery_date)
+        if draft is None:
+            return jsonify({"error": "Kein Tourentwurf fuer dieses Datum."}), 404
+
+        data = build_pdf(draft["stops"], delivery_date)
+        filename = f"Lieferliste_{delivery_date}.pdf"
+        return Response(
+            data,
+            mimetype="application/pdf",
             headers={"Content-Disposition": f'attachment; filename="{filename}"'},
         )
 
