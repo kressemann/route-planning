@@ -1,0 +1,81 @@
+<!doctype html>
+<html lang="de">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Tourenplanung</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+  <header class="topbar">
+    <h1>Tourenplanung</h1>
+  </header>
+
+  <main>
+    <section class="controls" aria-label="Tour laden">
+      <label for="delivery-date">Liefertag</label>
+      <input type="date" id="delivery-date" value="{{ today }}">
+      <button id="btn-load-tour" type="button">Tour laden</button>
+      <span id="load-status" class="status-text" role="status"></span>
+    </section>
+
+    <section class="controls" aria-label="Routenprofile">
+      <label for="profile-select">Profil</label>
+      <select id="profile-select">
+        <option value="">– auswaehlen –</option>
+      </select>
+      <button id="btn-load-profile" type="button">Profil laden</button>
+
+      <input type="text" id="profile-name" placeholder="Profilname">
+      <button id="btn-save-profile" type="button">Profil speichern</button>
+
+      <button id="btn-download-xlsx" type="button">XLSX herunterladen</button>
+    </section>
+
+    <section id="warnings" class="warnings" hidden aria-label="Warnungen">
+      <h2>⚠ Unklassifizierte Artikel – nicht in den Summen enthalten</h2>
+      <ul id="warnings-list"></ul>
+    </section>
+
+    <section id="stops-section" aria-label="Stoppliste">
+      <p id="empty-hint" class="hint">Noch keine Tour geladen.</p>
+      <div id="stops-header" class="stop-row stop-row--header" hidden>
+        <span class="col-handle"></span>
+        <span class="col-nr">Nr</span>
+        <span class="col-customer">Kunde / Adresse</span>
+        <span class="col-qty">Kisten</span>
+        <span class="col-qty">Schnittware</span>
+        <span class="col-qty">Kresse</span>
+        <span class="col-action"></span>
+      </div>
+      <div id="stops-list"></div>
+    </section>
+
+    <section id="gsmtasks-section" class="controls gsmtasks-controls" hidden aria-label="GSMtasks-Uebertragung">
+      <p id="gsmtasks-already-transferred" class="gsmtasks-warning" hidden>
+        ⚠ Diese Tour wurde bereits an GSMtasks übertragen.
+      </p>
+      <button id="btn-gsmtasks-transfer" type="button" class="btn-gsmtasks">An GSMtasks übertragen</button>
+      <div id="gsmtasks-results" class="gsmtasks-results" hidden></div>
+    </section>
+  </main>
+
+  <dialog id="gsmtasks-modal" aria-label="GSMtasks-Uebertragung bestaetigen">
+    <h2>Tour wirklich an GSMtasks übertragen?</h2>
+    <dl class="gsmtasks-summary">
+      <dt>Lieferdatum</dt><dd id="gsmtasks-modal-date"></dd>
+      <dt>Anzahl Stopps</dt><dd id="gsmtasks-modal-stops"></dd>
+      <dt>Gesamt Kisten</dt><dd id="gsmtasks-modal-kisten"></dd>
+      <dt>Gesamt Schnittware</dt><dd id="gsmtasks-modal-schnittware"></dd>
+      <dt>Gesamt Kresse</dt><dd id="gsmtasks-modal-kresse"></dd>
+    </dl>
+    <div class="gsmtasks-modal-actions">
+      <button id="btn-gsmtasks-cancel" type="button">Abbrechen</button>
+      <button id="btn-gsmtasks-confirm" type="button" class="btn-gsmtasks">Jetzt übertragen</button>
+    </div>
+  </dialog>
+
+  <script>window.APP_PREFIX = "{{ request.script_root }}";</script>
+  <script src="{{ url_for('static', filename='app.js') }}"></script>
+</body>
+</html>

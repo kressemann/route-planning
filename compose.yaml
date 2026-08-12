@@ -1,0 +1,55 @@
+# Eingebunden in das zentrale Automation Center: erreichbar ueber Caddy unter
+# https://automation.kressemann.de/tourenplanung (Basic Auth des Automation
+# Centers). Kein Host-Port mehr - die App ist nur ueber das interne Docker-
+# Netz "automation-network" fuer Caddy erreichbar.
+#
+#   docker compose run --rm tests    89+ Tests, ohne Netz
+#   docker compose up -d web         App im Netz automation-network
+#
+# Zugangsdaten kommen aus der lokalen .env (siehe .env.example) oder aus der
+# Shell-Umgebung - stehen nie im Image oder in dieser Datei.
+
+services:
+  web:
+    build:
+      context: .
+      args:
+        UID: ${UID:-1000}
+        GID: ${GID:-1000}
+    image: route-planning:latest
+    container_name: route-planning
+    restart: unless-stopped
+    expose:
+      - "5000"
+    environment:
+      ZOHO_CLIENT_ID: ${ZOHO_CLIENT_ID:-}
+      ZOHO_CLIENT_SECRET: ${ZOHO_CLIENT_SECRET:-}
+      ZOHO_REFRESH_TOKEN: ${ZOHO_REFRESH_TOKEN:-}
+      ZOHO_ORGANIZATION_ID: ${ZOHO_ORGANIZATION_ID:-}
+      ZOHO_REGION: ${ZOHO_REGION:-eu}
+      GSMTASKS_API_KEY: ${GSMTASKS_API_KEY:-}
+      TZ: Europe/Berlin
+    volumes:
+      # Muss dem Benutzer aus UID/GID gehoeren, sonst schlaegt das Schreiben
+      # der SQLite-Datei fehl: mkdir -p data && chown $(id -u):$(id -g) data
+      - ./data:/app/data
+    networks:
+      - automation-network
+
+  tests:
+    build:
+      context: .
+      args:
+        UID: ${UID:-1000}
+        GID: ${GID:-1000}
+    image: route-planning:latest
+    entrypoint: ["python", "-m", "pytest", "tests", "-q"]
+    environment:
+      TZ: Europe/Berlin
+    # Belegt, dass die Testsuite offline laeuft: ohne Netz, ohne echte
+    # Zoho-Zugangsdaten, keine Schreibzugriffe.
+    network_mode: none
+
+networks:
+  automation-network:
+    external: true
