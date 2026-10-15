@@ -50,6 +50,18 @@ services:
     # Zoho-Zugangsdaten, keine Schreibzugriffe.
     network_mode: none
 
+  # Logik der Weboberflaeche (static/ordering.js, static/totals.js):
+  #   docker compose run --rm tests-js
+  tests-js:
+    image: node:20-alpine
+    working_dir: /app
+    entrypoint: ["node", "--test", "tests/js/"]
+    volumes:
+      - ./routeplanning/static:/app/routeplanning/static:ro
+      - ./tests/js:/app/tests/js:ro
+    network_mode: none
+    profiles: ["tests"]
+
 networks:
   automation-network:
     external: true

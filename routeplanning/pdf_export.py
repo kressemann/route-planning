@@ -63,6 +63,13 @@ _SUBTITLE_STYLE = ParagraphStyle(
     fontSize=11,
     leading=14,
 )
+_SUMMARY_STYLE = ParagraphStyle(
+    "summary",
+    fontName="Helvetica-Bold",
+    fontSize=12,
+    leading=15,
+    spaceBefore=1 * mm,
+)
 _HEADER_CELL_STYLE = ParagraphStyle(
     "header-cell",
     fontName="Helvetica-Bold",
@@ -93,6 +100,37 @@ def _blank_if_zero(value: Any) -> str:
     if isinstance(value, float) and value.is_integer():
         value = int(value)
     return str(value)
+
+
+def summarize_stops(stops: list[dict[str, Any]]) -> dict[str, float]:
+    """Gesamtsummen ueber die exportierten Stopps (inkl. manueller Mengen).
+    Gegenstueck im Browser: static/totals.js (RouteTotals.summarize)."""
+    return {
+        "stops": len(stops),
+        "kisten": sum(float(s.get("kisten") or 0) for s in stops),
+        "schnittware": sum(float(s.get("schnittware") or 0) for s in stops),
+        "kresse": sum(float(s.get("kresse") or 0) for s in stops),
+    }
+
+
+def _format_number(value: float) -> str:
+    rounded = round(float(value), 2)
+    if rounded.is_integer():
+        return str(int(rounded))
+    return f"{rounded:g}".replace(".", ",")
+
+
+def format_summary(totals: dict[str, float]) -> str:
+    """"27 Stopps | 66 Kisten | 19 Schnittware | 2 Kresse" - identisch zur
+    Weboberflaeche (RouteTotals.formatSummary)."""
+    return " | ".join(
+        [
+            f"{_format_number(totals['stops'])} {'Stopp' if totals['stops'] == 1 else 'Stopps'}",
+            f"{_format_number(totals['kisten'])} {'Kiste' if totals['kisten'] == 1 else 'Kisten'}",
+            f"{_format_number(totals['schnittware'])} Schnittware",
+            f"{_format_number(totals['kresse'])} Kresse",
+        ]
+    )
 
 
 def _format_delivery_date(delivery_date: str) -> str:
@@ -181,6 +219,7 @@ def build_pdf(stops: list[dict[str, Any]], delivery_date: str) -> bytes:
     flowables = [
         Paragraph("Lieferliste", _TITLE_STYLE),
         Paragraph(f"Lieferdatum: {_format_delivery_date(delivery_date)}", _SUBTITLE_STYLE),
+        Paragraph(format_summary(summarize_stops(stops)), _SUMMARY_STYLE),
         Spacer(1, 4 * mm),
         _build_table(rows),
     ]

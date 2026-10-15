@@ -14,7 +14,11 @@ import sqlite3
 from pathlib import Path
 from typing import Any
 
-from .gsmtasks import OrderResult
+from .gsmtasks import (
+    OUTCOME_UNCLEAR,
+    SUCCESS_OUTCOMES,
+    OrderResult,
+)
 from .quantities import ArticleWarning, Stop
 
 DEFAULT_DB_PATH = Path(__file__).resolve().parent.parent / "data" / "route_planning.sqlite3"
@@ -53,7 +57,8 @@ CREATE TABLE IF NOT EXISTS route_warnings (
     draft_id INTEGER NOT NULL REFERENCES route_drafts(id) ON DELETE CASCADE,
     customer_name TEXT NOT NULL,
     article_name TEXT NOT NULL,
-    quantity REAL NOT NULL
+    quantity REAL NOT NULL,
+    reason TEXT NOT NULL DEFAULT 'unklassifiziert'
 );
 
 CREATE TABLE IF NOT EXISTS route_profiles (
@@ -74,6 +79,17 @@ CREATE TABLE IF NOT EXISTS gsmtasks_transfer_batches (
     success_count INTEGER NOT NULL,
     failure_count INTEGER NOT NULL,
     status TEXT NOT NULL
+);
+
+-- Dauerhafte Sperre der GSMtasks-Uebertragung je Liefertag (z.B. Tour wurde
+-- bereits manuell in GSMtasks angelegt). Bewusst eigene Tabelle, getrennt von
+-- route_drafts/route_stops: "Tour laden" ersetzt nur Stopps und Warnungen und
+-- kann die Sperre daher nicht entfernen. Es gibt keinen API-Endpunkt zum
+-- Aufheben - nur das Admin-Kommando (python -m routeplanning.admin).
+CREATE TABLE IF NOT EXISTS gsmtasks_transfer_locks (
+    delivery_date TEXT PRIMARY KEY,
+    reason TEXT NOT NULL,
+    created_at TEXT NOT NULL
 );
 
 -- Ergebnis je Stopp innerhalb eines Batches (fuer Erfolgreich/Fehlgeschlagen-Anzeige).
@@ -97,7 +113,13 @@ def _ensure_column(conn: sqlite3.Connection, table: str, column: str, ddl: str) 
     weil ``CREATE TABLE IF NOT EXISTS`` bestehende Tabellen nicht aendert."""
     existing = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
     if column not in existing:
-        conn.execute(f"ALTER TABLE {table} ADD COLUMN {ddl}")
+        try:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {ddl}")
+        except sqlite3.OperationalError as exc:
+            # Mehrere gunicorn-Worker migrieren beim Start gleichzeitig: hat ein
+            # anderer Worker die Spalte inzwischen angelegt, ist das kein Fehler.
+            if "duplicate column name" not in str(exc).lower():
+                raise
 
 
 def get_connection(db_path: Path = DEFAULT_DB_PATH) -> sqlite3.Connection:
@@ -112,6 +134,18 @@ def init_db(conn: sqlite3.Connection) -> None:
     conn.executescript(_SCHEMA)
     _ensure_column(conn, "route_stops", "phone", "phone TEXT NOT NULL DEFAULT ''")
     _ensure_column(conn, "route_stops", "email", "email TEXT NOT NULL DEFAULT ''")
+    _ensure_column(
+        conn, "route_warnings", "reason", "reason TEXT NOT NULL DEFAULT 'unklassifiziert'"
+    )
+    _ensure_column(
+        conn, "route_stops", "address_parts_json", "address_parts_json TEXT NOT NULL DEFAULT '{}'"
+    )
+    _ensure_column(conn, "gsmtasks_transfer_stops", "outcome", "outcome TEXT")
+    # Altbestand (vor Einfuehrung von outcome): success=1 -> created, sonst failed.
+    conn.execute(
+        "UPDATE gsmtasks_transfer_stops SET outcome = CASE WHEN success = 1 "
+        "THEN 'created' ELSE 'failed' END WHERE outcome IS NULL"
+    )
     conn.commit()
 
 
@@ -178,8 +212,8 @@ def replace_stops_from_zoho(
             "INSERT INTO route_stops ("
             "  draft_id, customer_id, customer_name, address, position, order_numbers,"
             "  kisten_auto, kisten_override, schnittware_auto, schnittware_override,"
-            "  kresse_auto, kresse_override, not_in_profile, phone, email"
-            ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "  kresse_auto, kresse_override, not_in_profile, phone, email, address_parts_json"
+            ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 draft_id,
                 stop.customer_id,
@@ -196,14 +230,21 @@ def replace_stops_from_zoho(
                 not_in_profile,
                 stop.phone,
                 stop.email,
+                json.dumps(stop.address_parts or {}, ensure_ascii=False),
             ),
         )
 
     for warning in warnings:
         conn.execute(
-            "INSERT INTO route_warnings (draft_id, customer_name, article_name, quantity) "
-            "VALUES (?, ?, ?, ?)",
-            (draft_id, warning.customer_name, warning.article_name, warning.quantity),
+            "INSERT INTO route_warnings (draft_id, customer_name, article_name, quantity, reason) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (
+                draft_id,
+                warning.customer_name,
+                warning.article_name,
+                warning.quantity,
+                warning.reason,
+            ),
         )
 
     conn.commit()
@@ -233,13 +274,13 @@ def get_draft(conn: sqlite3.Connection, delivery_date: str) -> dict[str, Any] | 
                 "customer_name": w["customer_name"],
                 "article_name": w["article_name"],
                 "quantity": w["quantity"],
+                "reason": w["reason"],
             }
             for w in warnings
         ],
-        "gsmtasks": {
-            "already_transferred": has_successful_gsmtasks_transfer(conn, draft_row["delivery_date"]),
-            "last_batch": get_latest_gsmtasks_batch(conn, draft_row["delivery_date"]),
-        },
+        "gsmtasks": gsmtasks_summary(
+            conn, draft_row["delivery_date"], [r["customer_id"] for r in stops]
+        ),
     }
 
 
@@ -268,6 +309,7 @@ def _stop_row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
         "not_in_profile": bool(row["not_in_profile"]),
         "phone": row["phone"],
         "email": row["email"],
+        "address_parts": json.loads(row["address_parts_json"] or "{}"),
     }
 
 
@@ -288,6 +330,21 @@ def save_stop_order_and_quantities(
     if draft_row is None:
         raise ValueError(f"Kein Tourentwurf fuer {delivery_date}")
     draft_id = draft_row["id"]
+
+    # Schutz gegen doppelte oder verlorene Stopps: die Liste muss jeden
+    # Stopp des Entwurfs genau einmal enthalten, sonst wird nichts gespeichert.
+    payload_ids = [str(item["customer_id"]) for item in stops_payload]
+    current_ids = {
+        r["customer_id"]
+        for r in conn.execute(
+            "SELECT customer_id FROM route_stops WHERE draft_id = ?", (draft_id,)
+        ).fetchall()
+    }
+    if len(payload_ids) != len(set(payload_ids)) or set(payload_ids) != current_ids:
+        raise ValueError(
+            "Stoppliste unvollstaendig oder doppelt - bitte Tour neu laden. "
+            "Nichts gespeichert."
+        )
 
     for position, item in enumerate(stops_payload):
         row = conn.execute(
@@ -366,6 +423,28 @@ def save_profile(conn: sqlite3.Connection, name: str, customer_ids: list[str]) -
         (name, json.dumps(customer_ids), now, now),
     )
     conn.commit()
+
+
+def merge_profile_order(previous: list[str], current: list[str]) -> list[str]:
+    """Neue Profilreihenfolge aus der aktuellen Tour, ohne Kunden zu verlieren.
+
+    ``current`` (die Reihenfolge der heutigen Tour) ist massgeblich. Kunden
+    aus ``previous``, die heute keinen Auftrag haben, bleiben im Profil und
+    werden direkt hinter ihrem bisherigen Vorgaenger eingereiht (bzw. am
+    Anfang, wenn sie vorher an erster Stelle standen).
+    """
+    result = list(dict.fromkeys(current))
+    present = set(result)
+    for index, customer_id in enumerate(previous):
+        if customer_id in present:
+            continue
+        anchor = next(
+            (previous[j] for j in range(index - 1, -1, -1) if previous[j] in present),
+            None,
+        )
+        result.insert(result.index(anchor) + 1 if anchor is not None else 0, customer_id)
+        present.add(customer_id)
+    return result
 
 
 def get_profile(conn: sqlite3.Connection, name: str) -> dict[str, Any] | None:
@@ -449,16 +528,94 @@ def has_successful_gsmtasks_transfer(conn: sqlite3.Connection, delivery_date: st
     return row is not None
 
 
+def gsmtasks_stop_states(conn: sqlite3.Connection, delivery_date: str) -> dict[str, dict[str, Any]]:
+    """Uebertragungsstand je customer_id fuer ein Lieferdatum ueber alle
+    Versuche: ``transferred`` = mindestens einmal angelegt/vorgefunden
+    (mit Order-URL), sonst ``outcome`` des letzten Versuchs (z.B. unclear)."""
+    rows = conn.execute(
+        "SELECT s.* FROM gsmtasks_transfer_stops s "
+        "JOIN gsmtasks_transfer_batches b ON b.id = s.batch_id "
+        "WHERE b.delivery_date = ? ORDER BY s.id ASC",
+        (delivery_date,),
+    ).fetchall()
+    states: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        state = states.setdefault(
+            row["customer_id"], {"transferred": False, "outcome": None, "order_url": None}
+        )
+        if state["transferred"]:
+            continue
+        state["outcome"] = row["outcome"]
+        if row["outcome"] in SUCCESS_OUTCOMES:
+            state["transferred"] = True
+            state["order_url"] = row["gsmtasks_order_url"]
+    return states
+
+
+def get_gsmtasks_lock(conn: sqlite3.Connection, delivery_date: str) -> dict[str, str] | None:
+    row = conn.execute(
+        "SELECT delivery_date, reason, created_at FROM gsmtasks_transfer_locks WHERE delivery_date = ?",
+        (delivery_date,),
+    ).fetchone()
+    return dict(row) if row is not None else None
+
+
+def lock_gsmtasks_transfer(conn: sqlite3.Connection, delivery_date: str, reason: str) -> dict[str, str]:
+    """Sperrt die GSMtasks-Uebertragung fuer einen Liefertag dauerhaft.
+    Idempotent: eine bestehende Sperre bleibt mit ihrem Grund erhalten."""
+    _dt.date.fromisoformat(delivery_date)
+    if not reason.strip():
+        raise ValueError("Sperrgrund fehlt.")
+    conn.execute(
+        "INSERT OR IGNORE INTO gsmtasks_transfer_locks (delivery_date, reason, created_at) "
+        "VALUES (?, ?, ?)",
+        (delivery_date, reason.strip(), _now()),
+    )
+    conn.commit()
+    return get_gsmtasks_lock(conn, delivery_date)
+
+
+def unlock_gsmtasks_transfer(conn: sqlite3.Connection, delivery_date: str) -> bool:
+    """Hebt eine Sperre auf - nur fuer das Admin-Kommando, nicht per Web/API."""
+    cur = conn.execute("DELETE FROM gsmtasks_transfer_locks WHERE delivery_date = ?", (delivery_date,))
+    conn.commit()
+    return cur.rowcount > 0
+
+
+def gsmtasks_summary(
+    conn: sqlite3.Connection, delivery_date: str, customer_ids: list[str]
+) -> dict[str, Any]:
+    """Uebertragungsstand des aktuellen Tourentwurfs fuer die Oberflaeche."""
+    states = gsmtasks_stop_states(conn, delivery_date)
+    transferred = [cid for cid in customer_ids if states.get(cid, {}).get("transferred")]
+    unclear = [
+        cid
+        for cid in customer_ids
+        if not states.get(cid, {}).get("transferred")
+        and states.get(cid, {}).get("outcome") == OUTCOME_UNCLEAR
+    ]
+    return {
+        "locked": get_gsmtasks_lock(conn, delivery_date),
+        "already_transferred": bool(customer_ids) and len(transferred) == len(customer_ids),
+        "transferred_count": len(transferred),
+        "unclear_count": len(unclear),
+        "stop_count": len(customer_ids),
+        "last_batch": get_latest_gsmtasks_batch(conn, delivery_date),
+    }
+
+
 def record_gsmtasks_transfer(
     conn: sqlite3.Connection, delivery_date: str, results: list[OrderResult]
 ) -> dict[str, Any]:
     """Speichert das Ergebnis eines Uebertragungsversuchs (ein Klick auf
-    "Jetzt uebertragen") als Batch mit einer Zeile je Stopp."""
+    "Jetzt uebertragen") als Batch mit einer Zeile je Stopp (inkl. outcome)."""
     now = _now()
     success_count = sum(1 for r in results if r.success)
     failure_count = len(results) - success_count
     if not results:
         status = "failed"
+    elif any(r.outcome == OUTCOME_UNCLEAR for r in results):
+        status = "unclear"
     elif failure_count == 0:
         status = "success"
     elif success_count == 0:
@@ -478,8 +635,8 @@ def record_gsmtasks_transfer(
         conn.execute(
             "INSERT INTO gsmtasks_transfer_stops ("
             "  batch_id, customer_id, customer_name, external_id, success,"
-            "  gsmtasks_order_id, gsmtasks_order_url, gsmtasks_task_url, error_message"
-            ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "  gsmtasks_order_id, gsmtasks_order_url, gsmtasks_task_url, error_message, outcome"
+            ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 batch_id,
                 result.customer_id,
@@ -490,6 +647,7 @@ def record_gsmtasks_transfer(
                 result.order_url,
                 result.task_url,
                 result.error,
+                result.outcome,
             ),
         )
 
@@ -518,6 +676,8 @@ def get_gsmtasks_batch(conn: sqlite3.Connection, batch_id: int) -> dict[str, Any
                 "customer_id": s["customer_id"],
                 "customer_name": s["customer_name"],
                 "success": bool(s["success"]),
+                "outcome": s["outcome"],
+                "order_url": s["gsmtasks_order_url"],
                 "error": s["error_message"],
             }
             for s in stops

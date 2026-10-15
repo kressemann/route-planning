@@ -11,10 +11,12 @@ dieser Datei nicht betroffen und bleibt unveraendert read-only.
 
 from __future__ import annotations
 
+import datetime as _dt
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import requests
 
@@ -35,9 +37,49 @@ API_VERSION = "2.11.4"
 
 DROP_OFF_CATEGORY = "drop_off"
 
+#: Ergebnis je Stopp eines Uebertragungsversuchs.
+OUTCOME_CREATED = "created"  # in diesem Versuch angelegt (HTTP 200/201)
+OUTCOME_EXISTING = "existing"  # Order mit unserer external_id existierte bereits
+OUTCOME_FAILED = "failed"  # von GSMtasks eindeutig abgelehnt (4xx) - nicht angelegt
+OUTCOME_UNCLEAR = "unclear"  # Ausgang unbekannt (Timeout, Verbindungsabbruch, 5xx)
+OUTCOME_NOT_SENT = "not_sent"  # nach einem unklaren Ergebnis bewusst nicht gesendet
+SUCCESS_OUTCOMES = frozenset({OUTCOME_CREATED, OUTCOME_EXISTING})
+
+#: Zeitzone der Liefertage - Zeitfenster je Aufgabe = ganzer Liefertag hier.
+DELIVERY_TIMEZONE = ZoneInfo("Europe/Berlin")
+
+#: Praefix der external_id. Produktiv immer "routeplanning"; isolierte Tests
+#: verwenden einen eigenen Praefix, damit sie nie mit echten oder frueheren
+#: Test-Orders kollidieren (siehe create_app(external_id_prefix=...)).
+EXTERNAL_ID_PREFIX = "routeplanning"
+
+#: Pflichtbestandteile der Zieladresse (Schluessel aus Stop.address_parts).
+ADDRESS_REQUIRED_PARTS = ("street", "zip", "city", "country")
+
 
 class GSMtasksError(RuntimeError):
     pass
+
+
+def describe_http_error(status_code: int, action: str) -> str:
+    """Verstaendliche Fehlermeldung fuer die Oberflaeche - ohne Secrets."""
+    if status_code == 401:
+        return (
+            f"{action}: GSMtasks lehnt den API-Schluessel ab (HTTP 401 \"Invalid token\"). "
+            "Der Schluessel ist ungueltig, widerrufen oder neu erzeugt worden - bitte in "
+            "GSMtasks einen neuen API-Schluessel erstellen und GSMTASKS_API_KEY in der .env "
+            "ersetzen."
+        )
+    if status_code == 403:
+        return (
+            f"{action}: keine Berechtigung (HTTP 403). Der Benutzer des API-Schluessels "
+            "darf diese Aktion in GSMtasks nicht ausfuehren."
+        )
+    if status_code == 429:
+        return f"{action}: zu viele Anfragen an GSMtasks (HTTP 429) - bitte spaeter erneut versuchen."
+    if status_code >= 500:
+        return f"{action}: GSMtasks-Serverfehler (HTTP {status_code})."
+    return f"{action}: HTTP {status_code}"
 
 
 def load_env(path: Path = ENV_FILE) -> dict[str, str]:
@@ -55,16 +97,28 @@ def load_env(path: Path = ENV_FILE) -> dict[str, str]:
     return values
 
 
-def build_external_id(delivery_date: str, customer_id: str) -> str:
-    """Deterministische external_id je Stopp (Lieferdatum + Zoho-customer_id).
+def build_external_id(
+    delivery_date: str, customer_id: str, prefix: str = EXTERNAL_ID_PREFIX
+) -> str:
+    """Deterministische external_id je Stopp (Praefix + Lieferdatum + Zoho-customer_id).
 
-    Wird sowohl als Order- als auch als Task-external_id verwendet. GSMtasks
-    erkennt anhand der Order-external_id bereits vorhandene Bestellungen und
-    aktualisiert sie statt sie zu duplizieren (offizielle API-Doku) - das ist
-    die serverseitige zweite Schutzschicht gegen Duplikate. Die primaere
-    Schutzschicht ist die lokale Pruefung in db.py vor dem Versand.
+    Wird als Order- und Task-external_id verwendet. Duplikatschutz: vor dem
+    Senden wird lokal (db.gsmtasks_stop_states) und per
+    ``GET /orders/?external_id=`` geprueft, ob der Stopp schon existiert. Ob
+    GSMtasks selbst doppelte external_ids abweist, ist im Schema nicht
+    dokumentiert - darauf wird sich bewusst nicht verlassen.
     """
-    return f"routeplanning::{delivery_date}::{customer_id}"
+    return f"{prefix}::{delivery_date}::{customer_id}"
+
+
+def delivery_window(delivery_date: str) -> tuple[str, str]:
+    """Zeitfenster der Aufgabe: Liefertag 00:00:00 bis 23:59:59 Europe/Berlin,
+    als ISO-8601 mit dem an diesem Tag gueltigen UTC-Offset (+01:00/+02:00).
+    Massgeblich ist ausschliesslich das Lieferdatum des Tourentwurfs."""
+    day = _dt.date.fromisoformat(delivery_date)
+    start = _dt.datetime.combine(day, _dt.time(0, 0, 0), tzinfo=DELIVERY_TIMEZONE)
+    end = _dt.datetime.combine(day, _dt.time(23, 59, 59), tzinfo=DELIVERY_TIMEZONE)
+    return start.isoformat(), end.isoformat()
 
 
 def build_description(kisten: float, schnittware: float, kresse: float) -> str:
@@ -91,53 +145,95 @@ class DropoffTask:
 
     customer_id: str
     external_id: str
-    reference: str
     customer_name: str
-    address: str
-    description: str
+    #: Strukturierte Zoho-Lieferadresse (street, street2, zip, city, country).
+    address_parts: dict[str, str]
     position: float
-    phone: str = ""
-    email: str = ""
+    #: Liefertag des Tourentwurfs (JJJJ-MM-TT) -> complete_after/complete_before.
+    delivery_date: str
 
 
 @dataclass
 class OrderResult:
-    """Ergebnis eines einzelnen Order-/Task-Anlegeversuchs - wird pro Stopp
-    lokal gespeichert (siehe db.record_gsmtasks_transfer)."""
+    """Ergebnis je Stopp - wird lokal gespeichert (db.record_gsmtasks_transfer).
+
+    ``outcome`` siehe OUTCOME_*; fehlt es, wird es aus ``success`` abgeleitet
+    (created/failed). ``success`` ist True genau fuer created/existing."""
 
     customer_id: str
     customer_name: str
     external_id: str
-    success: bool
+    success: bool = False
     order_id: str | None = None
     order_url: str | None = None
     task_url: str | None = None
     error: str | None = None
+    outcome: str | None = field(default=None)
+
+    def __post_init__(self) -> None:
+        if self.outcome is None:
+            self.outcome = OUTCOME_CREATED if self.success else OUTCOME_FAILED
+        self.success = self.outcome in SUCCESS_OUTCOMES
+
+
+def missing_address_parts(parts: dict[str, str] | None) -> list[str]:
+    """Pflichtbestandteile der Zieladresse, die fehlen (leer = vollstaendig)."""
+    parts = parts or {}
+    return [key for key in ADDRESS_REQUIRED_PARTS if not str(parts.get(key) or "").strip()]
+
+
+def build_address(parts: dict[str, str]) -> dict[str, str]:
+    """Zieladresse fuer GSMtasks (NestedAddress): einzeilige ``raw_address``
+    ohne Ansprechpartner-/Firmenzeile plus strukturierte Felder, damit
+    GSMtasks eindeutig geokodieren kann. Die Hausnummer bleibt Teil von
+    ``street`` - Zoho liefert sie nicht getrennt, und eine Zerlegung waere
+    geraten."""
+    street = str(parts.get("street") or "").strip()
+    street2 = str(parts.get("street2") or "").strip()
+    postal_code = str(parts.get("zip") or "").strip()
+    city = str(parts.get("city") or "").strip()
+    country = str(parts.get("country") or "").strip()
+    raw = ", ".join(
+        part for part in (street, street2, f"{postal_code} {city}".strip(), country) if part
+    )
+    return {
+        "raw_address": raw,
+        "street": street,
+        "postal_code": postal_code,
+        "city": city,
+        "country": country,
+    }
 
 
 def build_order_payload(task: DropoffTask, account_url: str) -> dict[str, Any]:
-    """Baut den Request-Body fuer ``POST /orders/`` gemaess OrderSerializerV2/
-    TaskSerializerV2 (offizielles OpenAPI-Schema). Ein Order mit genau einem
-    drop_off-Task, keine Routenoptimierung, kein auto_assign."""
-    contact: dict[str, Any] = {"name": task.customer_name, "company": task.customer_name}
-    if task.phone:
-        contact["phones"] = [task.phone]
-    if task.email:
-        contact["emails"] = [task.email]
+    """Request-Body fuer ``POST /orders/`` (OrderSerializerV2/TaskSerializerV2,
+    offizielles OpenAPI-Schema 2.11.x). Bewusst minimal:
 
+    * ``account`` - einziges beschreibbares Pflichtfeld laut Schema
+    * ``external_id`` - Duplikatschutz (Vorabpruefung per GET /orders/?external_id=)
+    * ``contact.name`` = Kundenname, ``address`` = Lieferadresse
+    * ``position`` = Reihenfolge der Tourenplanung
+    * ``complete_after``/``complete_before`` = Liefertag 00:00-23:59:59
+      Europe/Berlin (ohne diese Felder setzt GSMtasks den Zeitpunkt der
+      Uebertragung - im Test am 15.10.2026 beobachtet)
+    * ``auto_assign: False`` und KEIN ``assignee`` -> Aufgabe bleibt "Nicht zugewiesen"
+    * ``category: drop_off`` - Auslieferung (wie bisher)
+    Keine Routenoptimierung, keine Beschreibung/Telefon/E-Mail/Referenz.
+    """
+    complete_after, complete_before = delivery_window(task.delivery_date)
     return {
         "account": account_url,
         "external_id": task.external_id,
-        "reference": task.reference,
         "auto_assign": False,
         "tasks_data": [
             {
                 "external_id": task.external_id,
                 "category": DROP_OFF_CATEGORY,
-                "contact": contact,
-                "address": {"raw_address": task.address},
-                "description": task.description,
+                "contact": {"name": task.customer_name},
+                "address": build_address(task.address_parts),
                 "position": task.position,
+                "complete_after": complete_after,
+                "complete_before": complete_before,
                 "auto_assign": False,
             }
         ],
@@ -212,7 +308,7 @@ class GSMtasksClient:
 
         if response.status_code != 200:
             raise GSMtasksError(
-                f"Account konnte nicht ermittelt werden: HTTP {response.status_code}"
+                describe_http_error(response.status_code, "Account konnte nicht ermittelt werden")
             )
         try:
             accounts = response.json()
@@ -222,6 +318,32 @@ class GSMtasksClient:
             raise GSMtasksError("Kein GSMtasks-Account fuer diesen API-Key gefunden.")
         return accounts[0]["url"]
 
+    def find_orders_by_external_id(self, external_id: str) -> list[dict[str, Any]]:
+        """Rein lesend: vorhandene Orders mit genau dieser external_id
+        (``GET /orders/?external_id=...``). Wirft GSMtasksError, wenn das
+        nicht eindeutig beantwortet werden kann - der Aufrufer sendet dann
+        nichts."""
+        try:
+            response = self.session.get(
+                f"{BASE_URL}/orders/",
+                headers=self._headers(),
+                params={"external_id": external_id},
+                timeout=30,
+            )
+        except requests.RequestException as exc:
+            raise GSMtasksError(f"GSMtasks nicht erreichbar: {type(exc).__name__}") from None
+        if response.status_code != 200:
+            raise GSMtasksError(
+                describe_http_error(response.status_code, "Vorabpruefung auf vorhandene Auftraege fehlgeschlagen")
+            )
+        try:
+            orders = response.json()
+        except ValueError:
+            raise GSMtasksError("Vorabpruefung fehlgeschlagen: keine JSON-Antwort") from None
+        if isinstance(orders, dict):  # falls paginiert mit "results"
+            orders = orders.get("results") or []
+        return [o for o in orders if o.get("external_id") == external_id]
+
     def create_dropoff_order(self, task: DropoffTask, account_url: str) -> OrderResult:
         """Legt genau einen Order mit genau einem drop_off-Task an
         (``POST /orders/``). Schlaegt dieser eine Stopp fehl, wird das als
@@ -229,45 +351,52 @@ class GSMtasksClient:
         Exception zu werfen - ein fehlgeschlagener Stopp darf den restlichen
         Batch nicht abbrechen (siehe app.py)."""
         payload = build_order_payload(task, account_url)
+
+        def result(outcome: str, **kwargs: Any) -> OrderResult:
+            return OrderResult(
+                customer_id=task.customer_id,
+                customer_name=task.customer_name,
+                external_id=task.external_id,
+                outcome=outcome,
+                **kwargs,
+            )
+
         try:
             response = self.session.post(
                 f"{BASE_URL}/orders/", headers=self._headers(), json=payload, timeout=30
             )
+        except requests.ConnectTimeout:
+            # Verbindung kam nie zustande -> Anfrage wurde sicher nicht verarbeitet.
+            return result(OUTCOME_FAILED, error="GSMtasks nicht erreichbar (Verbindungsaufbau)")
         except requests.RequestException as exc:
-            return OrderResult(
-                customer_id=task.customer_id,
-                customer_name=task.customer_name,
-                external_id=task.external_id,
-                success=False,
-                error=f"GSMtasks nicht erreichbar: {type(exc).__name__}",
+            # Anfrage evtl. schon angekommen (Timeout beim Lesen, Abbruch) ->
+            # Ausgang unbekannt, keine automatische Wiederholung.
+            return result(
+                OUTCOME_UNCLEAR,
+                error=f"Ausgang unklar ({type(exc).__name__}) - vor erneutem Versuch wird "
+                "in GSMtasks nach dem Stopp gesucht",
             )
 
-        if response.status_code not in (200, 201):
-            return OrderResult(
-                customer_id=task.customer_id,
-                customer_name=task.customer_name,
-                external_id=task.external_id,
-                success=False,
-                error=_safe_error_detail(response),
+        if response.status_code >= 500:
+            return result(
+                OUTCOME_UNCLEAR,
+                error=describe_http_error(response.status_code, "Ausgang unklar")
+                + " - vor erneutem Versuch wird in GSMtasks nach dem Stopp gesucht",
             )
+        if response.status_code not in (200, 201):
+            if response.status_code in (401, 403, 429):
+                error = describe_http_error(response.status_code, "Nicht angelegt")
+            else:
+                error = "Nicht angelegt: " + _safe_error_detail(response)
+            return result(OUTCOME_FAILED, error=error)
 
         try:
             body = response.json()
         except ValueError:
-            return OrderResult(
-                customer_id=task.customer_id,
-                customer_name=task.customer_name,
-                external_id=task.external_id,
-                success=False,
-                error=f"HTTP {response.status_code}: keine JSON-Antwort",
-            )
-
+            body = {}
         tasks = body.get("tasks") or []
-        return OrderResult(
-            customer_id=task.customer_id,
-            customer_name=task.customer_name,
-            external_id=task.external_id,
-            success=True,
+        return result(
+            OUTCOME_CREATED,
             order_id=body.get("id"),
             order_url=body.get("url"),
             task_url=tasks[0] if tasks else None,

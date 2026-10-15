@@ -21,10 +21,13 @@ ENV_FILE = PROJECT_ROOT / ".env"
 DEFAULT_REGION = "eu"
 MAX_RETRIES = 4
 
-#: Status, die eine tatsaechlich zu beliefernde Bestellung darstellen.
-#: "draft" sind Planungsentwuerfe (siehe production-planning), "void" und
-#: "cancelled" sind storniert - beide gehoeren nicht in eine Tour.
-DELIVERABLE_STATUSES = frozenset({"open", "confirmed", "invoiced", "overdue", "partially_invoiced"})
+#: Status, die NICHT in eine Tour gehoeren: "draft" sind Planungsentwuerfe
+#: (siehe production-planning), "void" ist storniert. Alle anderen Status
+#: zaehlen - insbesondere "shipped"/"fulfilled": Zoho setzt sie, sobald der
+#: Versand gebucht ist, die Lieferung steht dann aber trotzdem auf der Tour.
+#: Eine Positivliste hat genau diese Auftraege frueher stillschweigend
+#: verloren (live belegt am 14.10.2026: 8 Auftraege "shipped" -> 0 Stopps).
+EXCLUDED_STATUSES = frozenset({"draft", "void"})
 
 
 class ZohoError(RuntimeError):
@@ -211,7 +214,8 @@ class ZohoInventory:
             page += 1
 
     def sales_orders_shipped_on(self, day: _dt.date) -> list[dict[str, Any]]:
-        """Alle nicht-stornierten Auftraege mit Versand-/Liefertermin ``day``.
+        """Alle Auftraege mit Versand-/Liefertermin ``day`` ausser Entwuerfen und
+        stornierten (siehe :data:`EXCLUDED_STATUSES`).
 
         Der Versandtermin (``shipment_date``) ist in diesem Datenmodell der
         Liefertag. Die API filtert Datumsangaben unzuverlaessig (siehe
@@ -224,7 +228,7 @@ class ZohoInventory:
                 shipment_date_start=wanted, shipment_date_end=wanted
             )
             if order.get("shipment_date") == wanted
-            and order.get("status") in DELIVERABLE_STATUSES
+            and order.get("status") not in EXCLUDED_STATUSES
         ]
         return [self.get_sales_order(o["salesorder_id"]) for o in summaries]
 

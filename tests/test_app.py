@@ -10,7 +10,7 @@ from openpyxl import load_workbook
 from pypdf import PdfReader
 
 from routeplanning.app import create_app
-from routeplanning.zoho import DELIVERABLE_STATUSES
+from routeplanning.zoho import EXCLUDED_STATUSES
 
 
 class FakeZoho:
@@ -30,7 +30,7 @@ class FakeZoho:
         return [
             o
             for o in self._orders
-            if o["shipment_date"] == wanted and o["status"] in DELIVERABLE_STATUSES
+            if o["shipment_date"] == wanted and o["status"] not in EXCLUDED_STATUSES
         ]
 
     def get_item(self, item_id):

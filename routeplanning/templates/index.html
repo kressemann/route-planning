@@ -19,6 +19,8 @@
       <span id="load-status" class="status-text" role="status"></span>
     </section>
 
+    <section id="tour-totals" class="tour-totals" hidden aria-label="Gesamtmengen" aria-live="polite"></section>
+
     <section class="controls" aria-label="Routenprofile">
       <label for="profile-select">Profil</label>
       <select id="profile-select">
@@ -34,7 +36,7 @@
     </section>
 
     <section id="warnings" class="warnings" hidden aria-label="Warnungen">
-      <h2>⚠ Unklassifizierte Artikel – nicht in den Summen enthalten</h2>
+      <h2>⚠ Ungeklärte Positionen und Adressen – Positionen nicht in den Summen enthalten</h2>
       <ul id="warnings-list"></ul>
     </section>
 
@@ -56,6 +58,8 @@
       <p id="gsmtasks-already-transferred" class="gsmtasks-warning" hidden>
         ⚠ Diese Tour wurde bereits an GSMtasks übertragen.
       </p>
+      <p id="gsmtasks-locked" class="gsmtasks-warning" hidden></p>
+      <p id="gsmtasks-status" class="gsmtasks-status" hidden></p>
       <button id="btn-gsmtasks-transfer" type="button" class="btn-gsmtasks">An GSMtasks übertragen</button>
       <div id="gsmtasks-results" class="gsmtasks-results" hidden></div>
     </section>
@@ -70,6 +74,16 @@
       <dt>Gesamt Schnittware</dt><dd id="gsmtasks-modal-schnittware"></dd>
       <dt>Gesamt Kresse</dt><dd id="gsmtasks-modal-kresse"></dd>
     </dl>
+    <div id="gsmtasks-precheck" class="gsmtasks-precheck" aria-live="polite"></div>
+    <p class="gsmtasks-hint">
+      Die Stopps werden in der aktuellen Reihenfolge ohne Fahrerzuweisung angelegt
+      und erscheinen in GSMtasks unter „Nicht zugewiesen“. Bestehende GSMtasks-Daten
+      werden nicht verändert.
+    </p>
+    <label class="gsmtasks-confirm-check">
+      <input type="checkbox" id="gsmtasks-confirm-manual">
+      Ich habe geprüft, dass diese Tour nicht bereits manuell in GSMtasks angelegt wurde.
+    </label>
     <div class="gsmtasks-modal-actions">
       <button id="btn-gsmtasks-cancel" type="button">Abbrechen</button>
       <button id="btn-gsmtasks-confirm" type="button" class="btn-gsmtasks">Jetzt übertragen</button>
@@ -77,6 +91,8 @@
   </dialog>
 
   <script>window.APP_PREFIX = "{{ request.script_root }}";</script>
+  <script src="{{ url_for('static', filename='ordering.js') }}"></script>
+  <script src="{{ url_for('static', filename='totals.js') }}"></script>
   <script src="{{ url_for('static', filename='app.js') }}"></script>
 </body>
 </html>
