@@ -235,6 +235,10 @@ class ZohoInventory:
     def get_sales_order(self, salesorder_id: str) -> dict[str, Any]:
         return self._request("GET", f"/salesorders/{salesorder_id}")["salesorder"]
 
+    def get_contact(self, contact_id: str) -> dict[str, Any]:
+        """Kundenstamm inkl. Standard-Lieferadresse (``shipping_address``)."""
+        return self._request("GET", f"/contacts/{contact_id}")["contact"]
+
     def get_item(self, item_id: str) -> dict[str, Any]:
         """Artikel-Stammdaten inkl. Custom Fields (z.B. Produktart). Gecacht."""
         if item_id not in self._item_cache:

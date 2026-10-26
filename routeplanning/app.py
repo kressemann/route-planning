@@ -110,7 +110,15 @@ def create_app(
         def get_ve_stueck(item_id: str) -> int | None:
             return ve_stueck_from_item(client.get_item(item_id), VE_STUECK_LABEL)
 
-        stops, warnings = build_stops(orders, get_produktart, get_ve_stueck)
+        def get_contact_address(customer_id: str) -> dict | None:
+            try:
+                return client.get_contact(customer_id).get("shipping_address")
+            except ZohoError:
+                # Ohne Kundenstamm bleibt die Auftragsadresse (und ggf. die Sperre).
+                logger.warning("Kundenstamm %s nicht lesbar", customer_id, exc_info=True)
+                return None
+
+        stops, warnings = build_stops(orders, get_produktart, get_ve_stueck, get_contact_address)
 
         conn = get_db()
         db.replace_stops_from_zoho(conn, delivery_date.isoformat(), stops, warnings)

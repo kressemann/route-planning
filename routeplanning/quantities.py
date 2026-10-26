@@ -96,6 +96,44 @@ def missing_address_parts(shipping_address: dict[str, Any] | None) -> list[str]:
     ]
 
 
+#: Zoho-Felder, die eine Lieferadresse fuer GSMtasks vollstaendig machen
+#: (entspricht gsmtasks.ADDRESS_REQUIRED_PARTS: street, zip, city, country).
+_TRANSFER_REQUIRED = ("address", "zip", "city", "country")
+
+
+def _normalized(value: Any) -> str:
+    return " ".join(str(value or "").split()).casefold()
+
+
+def _transfer_complete(address: dict[str, Any] | None) -> bool:
+    return all(_normalized((address or {}).get(key)) for key in _TRANSFER_REQUIRED)
+
+
+def resolve_shipping_address(
+    order_address: dict[str, Any] | None,
+    contact_address: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    """Waehlt die Lieferadresse eines Auftrags.
+
+    Zoho speichert im Auftrag eine Kopie der Lieferadresse. Wird die Adresse
+    im Kundenstamm spaeter ergaenzt (z.B. Land), bleibt die Kopie im Auftrag
+    unvollstaendig (live belegt am 26.10.2026: NA-05899 ohne Land). Dann gilt
+    die Standard-Lieferadresse des Kunden - aber nur, wenn sie vollstaendig
+    ist und Strasse mit Hausnummer und PLZ uebereinstimmen, also derselbe Ort
+    gemeint ist. Sonst bleibt die Auftragsadresse und damit die Sperre.
+    """
+    order_address = order_address or {}
+    if _transfer_complete(order_address) or not _transfer_complete(contact_address):
+        return order_address
+    contact_address = contact_address or {}
+    if any(
+        _normalized(order_address.get(key)) != _normalized(contact_address.get(key))
+        for key in ("address", "zip")
+    ):
+        return order_address
+    return contact_address
+
+
 def address_parts_from_zoho(shipping_address: dict[str, Any] | None) -> dict[str, str]:
     """Strukturierte Lieferadresse (ohne Ansprechpartner-Zeile)."""
     shipping_address = shipping_address or {}
@@ -153,6 +191,7 @@ def build_stops(
     orders: list[dict[str, Any]],
     get_produktart: Callable[[str], str | None],
     get_ve_stueck: Callable[[str], int | None] | None = None,
+    get_contact_address: Callable[[str], dict[str, Any] | None] | None = None,
 ) -> tuple[list[Stop], list[ArticleWarning]]:
     """Gruppiert Auftraege nach Kunde und berechnet die Verpackungsmengen.
 
@@ -183,9 +222,15 @@ def build_stops(
     for order in orders:
         customer_id = order.get("customer_id") or ""
         customer_name = order.get("customer_name") or ""
-        address = format_address(order.get("shipping_address"))
-        address_missing = missing_address_parts(order.get("shipping_address"))
-        address_parts = address_parts_from_zoho(order.get("shipping_address"))
+        shipping_address = order.get("shipping_address")
+        # Kundenstamm nur nachschlagen, wenn die Auftragsadresse unvollstaendig ist.
+        if get_contact_address and customer_id and not _transfer_complete(shipping_address):
+            shipping_address = resolve_shipping_address(
+                shipping_address, get_contact_address(customer_id)
+            )
+        address = format_address(shipping_address)
+        address_missing = missing_address_parts(shipping_address)
+        address_parts = address_parts_from_zoho(shipping_address)
 
         phone = (order.get("shipping_address") or {}).get("phone") or ""
         email = _first_contact_email(order)

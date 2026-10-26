@@ -33,9 +33,12 @@ mkdir -p data && chown "$(id -u):$(id -g)" data
 docker compose up -d web
 ```
 
-Erreichbar unter <http://127.0.0.1:5001> (nur localhost gebunden, siehe
-`compose.yaml`). Kein öffentlicher Port, keine Anbindung an Caddy/das
-Automation Center in V1.
+Produktiv seit 15.10.2026, eingebunden ins zentrale Automation Center:
+erreichbar über Caddy unter <https://automation.kressemann.de/tourenplanung/>
+(Basic Auth des Automation Centers, Route in
+`/opt/automation/infrastructure/caddy/Caddyfile`). Der Container hat keinen
+Host-Port, sondern ist nur im internen Docker-Netz `automation-network`
+erreichbar (siehe `compose.yaml`).
 
 ```bash
 docker compose logs -f web
@@ -80,7 +83,8 @@ die Testsuite offline läuft und nichts nach Zoho schreibt.
 5. Unklassifizierte Artikel, nicht ganzzahlige VE-Mengen und VE-Größen,
    die dem Artikelstamm widersprechen, erscheinen als deutliche Warnung und
    fließen nicht in die Summen ein. Lieferadressen ohne Straße/PLZ/Ort werden
-   ebenfalls als Warnung ausgewiesen.
+   ebenfalls als Warnung ausgewiesen (ein fehlendes Land meldet erst die
+   GSMtasks-Vorabprüfung).
 6. **An GSMtasks übertragen** öffnet einen Bestätigungsdialog (Lieferdatum,
    Anzahl Stopps, Gesamtmengen). Erst **Jetzt übertragen** legt pro
    sichtbarem Stopp genau einen drop_off-Task in GSMtasks an - Reihenfolge,
@@ -159,6 +163,27 @@ wsgi.py                Einstiegspunkt für gunicorn
   angelegte Aufgaben tragen keine `external_id` und sind nicht erkennbar).
 - Entwürfe, die vor Einführung der strukturierten Adresse geladen wurden,
   einmal per „Tour laden“ aktualisieren (Reihenfolge/Mengen bleiben erhalten).
+- Erste vollständige produktive Übertragung: Tour vom 26.10.2026, 11 Stopps,
+  alle angelegt (Batch-Status `success`).
+
+### Lieferadresse: Auftragskopie vs. Kundenstamm
+
+Zoho speichert in jedem Sales Order eine eigene Kopie der Lieferadresse.
+Wird die Adresse im Kundenstamm später ergänzt, bleibt die Kopie im Auftrag
+unverändert. Am 26.10.2026 blockierte deshalb „Fuxbau Johannes Neufeld“
+(NA-05899): Die Auftragskopie hatte kein Land (Ort „Neustadt-Hambach“), der
+Kundenstamm war vollständig (Weinstraße 240, 67434 Neustadt an der
+Weinstraße, Deutschland, z. Hd. Küche).
+
+Seitdem gilt beim „Tour laden“ (`quantities.resolve_shipping_address`): Ist
+die Auftragsadresse für GSMtasks unvollständig (Straße, PLZ, Ort, Land), wird
+die Standard-Lieferadresse des Kunden aus Zoho gelesen (nur `GET
+/contacts/{id}`) und vollständig übernommen, aber nur, wenn sie selbst
+vollständig ist **und** Straße mit Hausnummer sowie PLZ mit dem Auftrag
+übereinstimmen. Andernfalls bleibt die Auftragsadresse und damit die Sperre.
+Vollständige Auftragsadressen werden nie ersetzt. „Zu Händen“ erscheint nur
+in der Anzeige, nie in der GSMtasks-Adresse. Regressionstests:
+`tests/test_quantities_regression.py`.
 
 ### Dauerhafte Transfersperre je Liefertag
 
@@ -177,6 +202,5 @@ docker exec route-planning python -m routeplanning.admin unlock-gsmtasks 2026-10
 ## Offene Punkte für spätere Iterationen
 
 - Schreibzugriffe nach Zoho
-- Integration ins zentrale Automation Center (Caddy, gemeinsames Netz)
 - "Trotzdem erneut senden" nach vollständig erfolgreicher Übertragung
   (V1 blockiert das bewusst, um Duplikate zu vermeiden)

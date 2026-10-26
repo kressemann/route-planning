@@ -230,3 +230,91 @@ def test_warning_reason_persisted_and_old_db_migrated(tmp_path):
     db.replace_stops_from_zoho(conn, "2026-10-15", stops, warnings)
     draft = db.get_draft(conn, "2026-10-15")
     assert [w["reason"] for w in draft["warnings"]] == [REASON_ADRESSE_UNVOLLSTAENDIG]
+
+
+# -- Lieferadresse: Auftragskopie vs. Kundenstamm (26.10.2026) --------------
+
+# Live aus Zoho gelesen am 26.10.2026: NA-05899 (Fuxbau Johannes Neufeld)
+# traegt eine Adresskopie ohne Land; der Kundenstamm ist vollstaendig.
+_FUXBAU_ORDER_ADDRESS = {
+    "attention": "", "address": "Weinstraße 240", "street2": "",
+    "city": "Neustadt-Hambach", "state": "", "zip": "67434", "country": "",
+}
+_FUXBAU_CONTACT_ADDRESS = {
+    "attention": "Küche", "address": "Weinstraße 240", "street2": "",
+    "city": "Neustadt an der Weinstraße", "state": "Rheinland-Pfalz",
+    "zip": "67434", "country": "Deutschland", "country_code": "DE",
+}
+
+
+def test_fuxbau_20261026_incomplete_order_copy_uses_matching_contact_address():
+    from routeplanning.gsmtasks import build_address
+    from routeplanning.gsmtasks import missing_address_parts as transfer_missing
+
+    lines = [_line("kor", "Koriander Microgreens 1/9 Schale", 9)]
+    contacts = {"fux": _FUXBAU_CONTACT_ADDRESS}
+    stops, warnings = build_stops(
+        [_order("fux", lines, shipping_address=_FUXBAU_ORDER_ADDRESS, number="NA-05899")],
+        _no_produktart,
+        get_contact_address=contacts.get,
+    )
+    assert warnings == []
+    parts = stops[0].address_parts
+    assert parts == {
+        "street": "Weinstraße 240", "street2": "", "zip": "67434",
+        "city": "Neustadt an der Weinstraße", "country": "Deutschland",
+    }
+    assert transfer_missing(parts) == []
+    # "Zu Händen: Küche" steht in der Anzeige, nie in der GSMtasks-Adresse.
+    assert stops[0].address.splitlines()[0] == "Küche"
+    assert "Küche" not in build_address(parts)["raw_address"]
+    assert stops[0].kisten == 1
+
+
+def test_fuxbau_without_contact_lookup_still_blocks_on_country():
+    from routeplanning.gsmtasks import missing_address_parts as transfer_missing
+
+    stops, _ = build_stops(
+        [_order("fux", [_line("kor", "Koriander 1/9", 9)], shipping_address=_FUXBAU_ORDER_ADDRESS)],
+        _no_produktart,
+    )
+    assert transfer_missing(stops[0].address_parts) == ["country"]
+
+
+def test_contact_address_for_other_location_is_not_used():
+    from routeplanning.gsmtasks import missing_address_parts as transfer_missing
+
+    other = dict(_FUXBAU_CONTACT_ADDRESS, address="Andergasse 84")
+    stops, _ = build_stops(
+        [_order("fux", [_line("kor", "Koriander 1/9", 9)], shipping_address=_FUXBAU_ORDER_ADDRESS)],
+        _no_produktart,
+        get_contact_address={"fux": other}.get,
+    )
+    assert stops[0].address_parts["city"] == "Neustadt-Hambach"
+    assert transfer_missing(stops[0].address_parts) == ["country"]
+
+
+def test_truly_incomplete_addresses_stay_blocked():
+    from routeplanning.quantities import resolve_shipping_address
+
+    empty = {"attention": "Casella Landau", "country": "Deutschland"}
+    # Leere Auftragsadresse: kein Strasse/PLZ-Abgleich moeglich -> bleibt.
+    assert resolve_shipping_address(empty, _FUXBAU_CONTACT_ADDRESS) is empty
+    # Auch der Kundenstamm unvollstaendig -> bleibt.
+    no_country = dict(_FUXBAU_CONTACT_ADDRESS, country="")
+    assert resolve_shipping_address(_FUXBAU_ORDER_ADDRESS, no_country) is _FUXBAU_ORDER_ADDRESS
+    assert resolve_shipping_address(_FUXBAU_ORDER_ADDRESS, None) is _FUXBAU_ORDER_ADDRESS
+
+
+def test_complete_order_address_is_never_replaced_and_contact_not_read():
+    complete = dict(_FUXBAU_ORDER_ADDRESS, country="Deutschland")
+
+    def fail(_customer_id):
+        raise AssertionError("Kundenstamm darf nicht gelesen werden")
+
+    stops, _ = build_stops(
+        [_order("fux", [_line("kor", "Koriander 1/9", 9)], shipping_address=complete)],
+        _no_produktart,
+        get_contact_address=fail,
+    )
+    assert stops[0].address_parts["city"] == "Neustadt-Hambach"

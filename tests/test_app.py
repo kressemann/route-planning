@@ -21,9 +21,10 @@ class FakeZoho:
     einhaelt.
     """
 
-    def __init__(self, orders, items):
+    def __init__(self, orders, items, contacts=None):
         self._orders = orders
         self._items = items
+        self._contacts = contacts or {}
 
     def sales_orders_shipped_on(self, day):
         wanted = day.isoformat()
@@ -35,6 +36,9 @@ class FakeZoho:
 
     def get_item(self, item_id):
         return self._items[item_id]
+
+    def get_contact(self, contact_id):
+        return self._contacts.get(contact_id, {})
 
 
 ORDERS = [
