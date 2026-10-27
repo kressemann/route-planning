@@ -144,7 +144,7 @@ wsgi.py                Einstiegspunkt für gunicorn
   `position` (100, 200, … in Tour-Reihenfolge), `category: drop_off`,
   `complete_after`/`complete_before` = Liefertag 00:00:00–23:59:59
   Europe/Berlin mit korrektem UTC-Offset (ohne diese Felder ordnet GSMtasks
-  die Aufgabe dem Übertragungszeitpunkt zu), `auto_assign: false`. Kein `assignee` → Aufgaben bleiben „Nicht zugewiesen“.
+  die Aufgabe dem Übertragungszeitpunkt zu), `auto_assign: false`, `assignee` = User-URL des festen Fahrers (`GSMTASKS_ASSIGNEE_USER_ID`/`GSMTASKS_ASSIGNEE_NAME` in `compose.yaml`). Vor jeder Übertragung wird lesend per `GET /account_roles/?user=<uuid>` geprüft, dass genau eine aktive Fahrer-Rolle mit diesem Anzeigenamen existiert; sonst wird nichts gesendet (kein Fallback auf „Nicht zugewiesen“).
   Keine Routenoptimierung.
 - Vor dem Senden (rein lesend): API-Schlüssel prüfen (`GET /accounts/`), für
   jeden noch nicht übertragenen Stopp `GET /orders/?external_id=…`. Vorhandene

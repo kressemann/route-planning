@@ -12,12 +12,28 @@ import pytest
 
 from routeplanning import db
 from routeplanning.app import create_app
-from routeplanning.gsmtasks import GSMtasksError, OrderResult, build_external_id
+from routeplanning.gsmtasks import (
+    AssigneeConfigError,
+    GSMtasksError,
+    OrderResult,
+    build_external_id,
+    build_order_payload,
+    load_assignee,
+)
 from routeplanning.quantities import Stop
 
 ACCOUNT_URL = "https://api.gsmtasks.com/accounts/fake-account/"
 DAY = "2026-08-20"
 CONFIRM = {"confirm": True}
+DRIVER_ID = "b47e7f7c-6e71-436c-8305-e7a0b6b2e1f9"
+DRIVER_URL = f"https://api.gsmtasks.com/users/{DRIVER_ID}/"
+
+
+@pytest.fixture(autouse=True)
+def _driver_config(monkeypatch):
+    """Wie produktiv (compose.yaml): fester Fahrer "Kressemann"."""
+    monkeypatch.setenv("GSMTASKS_ASSIGNEE_USER_ID", DRIVER_ID)
+    monkeypatch.setenv("GSMTASKS_ASSIGNEE_NAME", "Kressemann")
 
 
 class FakeGSMtasksClient:
@@ -30,6 +46,8 @@ class FakeGSMtasksClient:
         self.unclear_but_created_ids = set()
         self.raise_on_resolve = raise_on_resolve
         self.raise_on_lookup = None
+        self.raise_on_verify = None
+        self.verified = []  # verify_assignee-Aufrufe (lesend)
         self.calls = []  # create_dropoff_order-Aufrufe (= Schreibzugriffe)
         self.lookups = []
         self.remote_orders = {}  # external_id -> order-URL (wie in GSMtasks)
@@ -38,6 +56,12 @@ class FakeGSMtasksClient:
         if self.raise_on_resolve:
             raise self.raise_on_resolve
         return ACCOUNT_URL
+
+    def verify_assignee(self, assignee):
+        self.verified.append(assignee)
+        if self.raise_on_verify:
+            raise self.raise_on_verify
+        return assignee
 
     def find_orders_by_external_id(self, external_id):
         self.lookups.append(external_id)
@@ -572,3 +596,82 @@ def test_custom_external_id_prefix_isolates_test_runs(tmp_path):
         client.post(f"/api/draft/{DAY}/gsmtasks", json=CONFIRM)
     assert fake.calls[0].external_id == f"routeplanning-test2::{DAY}::c1"
     assert fake.lookups == [f"routeplanning-test2::{DAY}::c1"] * 2
+
+
+# -- Fahrerzuordnung ---------------------------------------------------------
+
+
+def test_transfer_assigns_every_task_to_configured_driver(app_and_gsmtasks):
+    app, fake = app_and_gsmtasks
+    _three(app)
+    with app.test_client() as client:
+        resp = client.post(f"/api/draft/{DAY}/gsmtasks", json=CONFIRM)
+    assert resp.status_code == 200
+    assert [a.user_id for a in fake.verified] == [DRIVER_ID]
+    assert [t.assignee_url for t in fake.calls] == [DRIVER_URL] * 3
+    # Der tatsaechlich gesendete Body enthaelt den Fahrer, ohne auto_assign.
+    for task in fake.calls:
+        payload = build_order_payload(task, ACCOUNT_URL)
+        assert payload["tasks_data"][0]["assignee"] == DRIVER_URL
+        assert payload["tasks_data"][0]["auto_assign"] is False and payload["auto_assign"] is False
+
+
+def test_precheck_reports_verified_driver(app_and_gsmtasks):
+    app, fake = app_and_gsmtasks
+    _three(app)
+    with app.test_client() as client:
+        body = client.get(f"/api/draft/{DAY}/gsmtasks/precheck").get_json()
+    assert body["assignee"] == {"name": "Kressemann", "user_id": DRIVER_ID}
+    assert body["ready"] is True
+    assert fake.calls == []
+
+
+@pytest.mark.parametrize("env", [
+    {},  # fehlt ganz
+    {"GSMTASKS_ASSIGNEE_USER_ID": DRIVER_ID},  # Name fehlt
+    {"GSMTASKS_ASSIGNEE_USER_ID": "Kressemann", "GSMTASKS_ASSIGNEE_NAME": "Kressemann"},  # keine UUID
+])
+def test_driver_config_error_blocks_transfer_and_precheck_before_any_write(tmp_path, env):
+    fake = FakeGSMtasksClient()
+    app = create_app(db_path=tmp_path / "t.sqlite3", gsmtasks_client_factory=lambda: fake,
+                     gsmtasks_assignee_loader=lambda: load_assignee(env))
+    app.testing = True
+    _three(app)
+    with app.test_client() as client:
+        pre = client.get(f"/api/draft/{DAY}/gsmtasks/precheck")
+        resp = client.post(f"/api/draft/{DAY}/gsmtasks", json=CONFIRM)
+    assert pre.status_code == 400 and "nichts" in pre.get_json()["error"]
+    assert resp.status_code == 400 and "nichts" in resp.get_json()["error"]
+    assert fake.calls == [] and fake.lookups == [] and fake.verified == []
+    assert _batch_count(app) == 0
+
+
+@pytest.mark.parametrize("error, status", [
+    (AssigneeConfigError("Fahrer-ID ... ist in GSMtasks unbekannt - es wird nichts uebertragen."), 400),
+    (AssigneeConfigError("Fahrer-ID ... nicht eindeutig: 2 Account-Rollen - es wird nichts uebertragen."), 400),
+    (AssigneeConfigError("Fahrer-ID ... heisst in GSMtasks 'X' - es wird nichts uebertragen."), 400),
+    (GSMtasksError("GSMtasks nicht erreichbar: ConnectionError"), 502),
+])
+def test_driver_not_verifiable_in_gsmtasks_sends_nothing(app_and_gsmtasks, error, status):
+    app, fake = app_and_gsmtasks
+    fake.raise_on_verify = error
+    _three(app)
+    with app.test_client() as client:
+        pre = client.get(f"/api/draft/{DAY}/gsmtasks/precheck")
+        resp = client.post(f"/api/draft/{DAY}/gsmtasks", json=CONFIRM)
+    assert pre.status_code == status and resp.status_code == status
+    assert fake.calls == []
+    assert _batch_count(app) == 0
+    # Kein stiller Fallback: Entwurf gilt weiterhin als nicht uebertragen.
+    assert app.test_client().get(f"/api/draft/{DAY}").get_json()["gsmtasks"]["already_transferred"] is False
+
+
+def test_already_transferred_tour_is_not_resent_and_driver_not_queried(app_and_gsmtasks):
+    app, fake = app_and_gsmtasks
+    _three(app)
+    with app.test_client() as client:
+        assert client.post(f"/api/draft/{DAY}/gsmtasks", json=CONFIRM).status_code == 200
+        fake.verified.clear()
+        resp = client.post(f"/api/draft/{DAY}/gsmtasks", json=CONFIRM)
+    assert resp.status_code == 409
+    assert len(fake.calls) == 3 and fake.verified == []

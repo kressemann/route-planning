@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import datetime as _dt
 import os
+import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -56,9 +57,22 @@ EXTERNAL_ID_PREFIX = "routeplanning"
 #: Pflichtbestandteile der Zieladresse (Schluessel aus Stop.address_parts).
 ADDRESS_REQUIRED_PARTS = ("street", "zip", "city", "country")
 
+#: Fester Fahrer fuer alle neu angelegten Aufgaben: GSMtasks-User-UUID plus
+#: erwarteter Anzeigename seiner Account-Rolle (z. B. "Kressemann"). Bewusst
+#: konfiguriert statt per Namenssuche - mehrere Integrations-Benutzer des
+#: Accounts haben ebenfalls den Vornamen "Kressemann".
+ASSIGNEE_USER_ID_KEY = "GSMTASKS_ASSIGNEE_USER_ID"
+ASSIGNEE_NAME_KEY = "GSMTASKS_ASSIGNEE_NAME"
+
 
 class GSMtasksError(RuntimeError):
     pass
+
+
+class AssigneeConfigError(ValueError):
+    """Fahrerzuordnung fehlt, ist ungueltig oder in GSMtasks nicht eindeutig.
+    Wird vor dem ersten Schreibzugriff geworfen - es wird dann nichts
+    uebertragen (kein Fallback auf "Nicht zugewiesen")."""
 
 
 def describe_http_error(status_code: int, action: str) -> str:
@@ -92,9 +106,44 @@ def load_env(path: Path = ENV_FILE) -> dict[str, str]:
                 continue
             key, _, value = line.partition("=")
             values[key.strip()] = value.strip().strip('"').strip("'")
-    if os.environ.get("GSMTASKS_API_KEY"):
-        values["GSMTASKS_API_KEY"] = os.environ["GSMTASKS_API_KEY"]
+    for key in ("GSMTASKS_API_KEY", ASSIGNEE_USER_ID_KEY, ASSIGNEE_NAME_KEY):
+        if os.environ.get(key):
+            values[key] = os.environ[key]
     return values
+
+
+@dataclass(frozen=True)
+class Assignee:
+    """Konfigurierter Fahrer. ``assignee`` eines Tasks ist laut API die
+    User-URL (nicht die Account-Rollen-URL)."""
+
+    user_id: str
+    name: str
+
+    @property
+    def user_url(self) -> str:
+        return f"{BASE_URL}/users/{self.user_id}/"
+
+
+def load_assignee(env: dict[str, str]) -> Assignee:
+    """Fahrer aus der Konfiguration - nur Formatpruefung, kein Netzwerk.
+    Ob der Fahrer in GSMtasks existiert, prueft ``verify_assignee``."""
+    user_id = (env.get(ASSIGNEE_USER_ID_KEY) or "").strip()
+    name = (env.get(ASSIGNEE_NAME_KEY) or "").strip()
+    if not user_id or not name:
+        missing = [k for k, v in ((ASSIGNEE_USER_ID_KEY, user_id), (ASSIGNEE_NAME_KEY, name)) if not v]
+        raise AssigneeConfigError(
+            "Fahrerzuordnung nicht konfiguriert (" + ", ".join(missing) + " fehlt) - "
+            "es wird nichts an GSMtasks uebertragen."
+        )
+    try:
+        parsed = uuid.UUID(user_id)
+    except ValueError:
+        raise AssigneeConfigError(
+            f"{ASSIGNEE_USER_ID_KEY} ist keine gueltige GSMtasks-User-ID (UUID erwartet) - "
+            "es wird nichts an GSMtasks uebertragen."
+        ) from None
+    return Assignee(user_id=str(parsed), name=name)
 
 
 def build_external_id(
@@ -151,6 +200,8 @@ class DropoffTask:
     position: float
     #: Liefertag des Tourentwurfs (JJJJ-MM-TT) -> complete_after/complete_before.
     delivery_date: str
+    #: User-URL des zugewiesenen Fahrers (Assignee.user_url) - Pflicht.
+    assignee_url: str = ""
 
 
 @dataclass
@@ -216,10 +267,14 @@ def build_order_payload(task: DropoffTask, account_url: str) -> dict[str, Any]:
     * ``complete_after``/``complete_before`` = Liefertag 00:00-23:59:59
       Europe/Berlin (ohne diese Felder setzt GSMtasks den Zeitpunkt der
       Uebertragung - im Test am 15.10.2026 beobachtet)
-    * ``auto_assign: False`` und KEIN ``assignee`` -> Aufgabe bleibt "Nicht zugewiesen"
+    * ``assignee`` = User-URL des konfigurierten Fahrers (nur am Task - das
+      Order-Feld ``assignee`` gibt es seit API 2.4.6 nicht mehr)
+    * ``auto_assign: False`` - keine automatische Fahrerwahl durch GSMtasks
     * ``category: drop_off`` - Auslieferung (wie bisher)
     Keine Routenoptimierung, keine Beschreibung/Telefon/E-Mail/Referenz.
     """
+    if not task.assignee_url:
+        raise AssigneeConfigError("Kein Fahrer fuer die Aufgabe gesetzt - es wird nichts uebertragen.")
     complete_after, complete_before = delivery_window(task.delivery_date)
     return {
         "account": account_url,
@@ -234,6 +289,7 @@ def build_order_payload(task: DropoffTask, account_url: str) -> dict[str, Any]:
                 "position": task.position,
                 "complete_after": complete_after,
                 "complete_before": complete_before,
+                "assignee": task.assignee_url,
                 "auto_assign": False,
             }
         ],
@@ -317,6 +373,55 @@ class GSMtasksClient:
         if not accounts:
             raise GSMtasksError("Kein GSMtasks-Account fuer diesen API-Key gefunden.")
         return accounts[0]["url"]
+
+    def verify_assignee(self, assignee: Assignee) -> Assignee:
+        """Rein lesend (``GET /account_roles/?user=<uuid>``): Der konfigurierte
+        Fahrer muss genau eine aktive Fahrer-Rolle mit dem erwarteten
+        Anzeigenamen haben. Sonst ``AssigneeConfigError`` - der Aufrufer
+        sendet dann nichts."""
+        try:
+            response = self.session.get(
+                f"{BASE_URL}/account_roles/",
+                headers=self._headers(),
+                params={"user": assignee.user_id},
+                timeout=30,
+            )
+        except requests.RequestException as exc:
+            raise GSMtasksError(f"GSMtasks nicht erreichbar: {type(exc).__name__}") from None
+        if response.status_code == 400:
+            # GSMtasks lehnt unbekannte User-UUIDs im Filter mit 400 ab.
+            raise AssigneeConfigError(
+                f"Fahrer-ID {assignee.user_id} ist in GSMtasks unbekannt - es wird nichts uebertragen."
+            )
+        if response.status_code != 200:
+            raise GSMtasksError(
+                describe_http_error(response.status_code, "Fahrer konnte nicht geprueft werden")
+            )
+        try:
+            roles = response.json()
+        except ValueError:
+            raise GSMtasksError("Fahrer konnte nicht geprueft werden: keine JSON-Antwort") from None
+        if isinstance(roles, dict):  # falls paginiert mit "results"
+            roles = roles.get("results") or []
+        roles = [r for r in roles if r.get("user") == assignee.user_url and not r.get("deleted_at")]
+        if len(roles) != 1:
+            raise AssigneeConfigError(
+                f"Fahrer-ID {assignee.user_id} nicht eindeutig: {len(roles)} Account-Rollen in "
+                "GSMtasks gefunden - es wird nichts uebertragen."
+            )
+        role = roles[0]
+        if not (role.get("is_worker") and role.get("is_active") and role.get("state") == "active"):
+            raise AssigneeConfigError(
+                f"Fahrer-ID {assignee.user_id} ist in GSMtasks kein aktiver Fahrer - "
+                "es wird nichts uebertragen."
+            )
+        display_name = (role.get("display_name") or "").strip()
+        if display_name != assignee.name:
+            raise AssigneeConfigError(
+                f"Fahrer-ID {assignee.user_id} heisst in GSMtasks {display_name!r}, konfiguriert ist "
+                f"{assignee.name!r} - es wird nichts uebertragen."
+            )
+        return assignee
 
     def find_orders_by_external_id(self, external_id: str) -> list[dict[str, Any]]:
         """Rein lesend: vorhandene Orders mit genau dieser external_id

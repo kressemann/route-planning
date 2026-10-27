@@ -28,6 +28,12 @@ services:
       ZOHO_ORGANIZATION_ID: ${ZOHO_ORGANIZATION_ID:-}
       ZOHO_REGION: ${ZOHO_REGION:-eu}
       GSMTASKS_API_KEY: ${GSMTASKS_API_KEY:-}
+      # Fester Fahrer fuer neu uebertragene Stopps (kein Secret). User-UUID
+      # aus GET /account_roles/ (Rolle "Kressemann", is_worker) - NICHT einer
+      # der Integrations-Benutzer mit Vorname "Kressemann". Der Anzeigename
+      # wird vor jeder Uebertragung lesend gegen GSMtasks geprueft.
+      GSMTASKS_ASSIGNEE_USER_ID: b47e7f7c-6e71-436c-8305-e7a0b6b2e1f9
+      GSMTASKS_ASSIGNEE_NAME: Kressemann
       TZ: Europe/Berlin
     volumes:
       # Muss dem Benutzer aus UID/GID gehoeren, sonst schlaegt das Schreiben

@@ -20,11 +20,14 @@ from .gsmtasks import (
     OUTCOME_EXISTING,
     OUTCOME_NOT_SENT,
     OUTCOME_UNCLEAR,
+    Assignee,
     DropoffTask,
     GSMtasksClient,
     GSMtasksError,
     OrderResult,
     build_external_id,
+    load_assignee,
+    load_env,
     missing_address_parts,
 )
 from .pdf_export import build_pdf
@@ -50,6 +53,7 @@ def create_app(
     zoho_client_factory=None,
     gsmtasks_client_factory=None,
     external_id_prefix: str = EXTERNAL_ID_PREFIX,
+    gsmtasks_assignee_loader=None,
 ) -> Flask:
     app = Flask(__name__)
     # Nur isolierte Tests setzen einen eigenen Praefix (eindeutige Test-IDs).
@@ -57,6 +61,9 @@ def create_app(
     app.config["DB_PATH"] = db_path or db.DEFAULT_DB_PATH
     app.config["ZOHO_CLIENT_FACTORY"] = zoho_client_factory or ZohoInventory.from_env
     app.config["GSMTASKS_CLIENT_FACTORY"] = gsmtasks_client_factory or GSMtasksClient.from_env
+    app.config["GSMTASKS_ASSIGNEE_LOADER"] = gsmtasks_assignee_loader or (
+        lambda: load_assignee(load_env())
+    )
 
     with app.app_context():
         conn = db.get_connection(app.config["DB_PATH"])
@@ -247,6 +254,11 @@ def create_app(
             return None, (jsonify({"error": "Der Tourentwurf enthaelt keine Stopps."}), 400)
         return draft, None
 
+    def _verified_assignee(client: Any) -> Assignee:
+        """Konfigurierter Fahrer, lesend in GSMtasks bestaetigt. Wirft
+        AssigneeConfigError (-> 400), bevor irgendetwas gesendet wird."""
+        return client.verify_assignee(app.config["GSMTASKS_ASSIGNEE_LOADER"]())
+
     @app.get("/api/draft/<delivery_date>/gsmtasks/precheck")
     @handle_errors
     def gsmtasks_precheck(delivery_date: str) -> Response:
@@ -260,7 +272,9 @@ def create_app(
             return error
         client: GSMtasksClient = app.config["GSMTASKS_CLIENT_FACTORY"]()
         client.resolve_account_url()  # prueft den API-Schluessel (GET /accounts/)
+        assignee = _verified_assignee(client)
         summary = _plan_summary(_plan_gsmtasks_transfer(conn, client, delivery_date, draft))
+        summary["assignee"] = {"name": assignee.name, "user_id": assignee.user_id}
         summary["ready"] = summary["new_count"] > 0 and not summary["address_incomplete"]
         return jsonify(summary)
 
@@ -270,8 +284,10 @@ def create_app(
         """Uebertraegt den aktuellen Tourentwurf als GSMtasks drop_off-Tasks.
 
         Nur nach expliziter Bestaetigung im Web (``{"confirm": true}``).
-        Reihenfolge kommt aus dem Entwurf (position 100, 200, ...), keine
-        Fahrerzuweisung (kein assignee, auto_assign False).
+        Reihenfolge kommt aus dem Entwurf (position 100, 200, ...). Alle Tasks
+        werden dem konfigurierten Fahrer zugewiesen (assignee, auto_assign
+        False); fehlt er oder ist er in GSMtasks nicht eindeutig, wird nichts
+        gesendet.
 
         Duplikatschutz - alles VOR dem ersten Schreibzugriff:
         * Stopps, die laut lokaler Historie schon angelegt sind, werden
@@ -299,6 +315,7 @@ def create_app(
 
         client: GSMtasksClient = app.config["GSMTASKS_CLIENT_FACTORY"]()
         account_url = client.resolve_account_url()
+        assignee = _verified_assignee(client)
         plan = _plan_gsmtasks_transfer(conn, client, delivery_date, draft)
 
         incomplete = [e["stop"]["customer_name"] for e in plan if e["status"] == "address_incomplete"]
@@ -337,6 +354,7 @@ def create_app(
                 address_parts=stop["address_parts"],
                 position=entry["position"],
                 delivery_date=delivery_date,
+                assignee_url=assignee.user_url,
             )
             result = client.create_dropoff_order(task, account_url)
             results.append(result)
@@ -345,8 +363,9 @@ def create_app(
 
         batch = db.record_gsmtasks_transfer(conn, delivery_date, results)
         logger.info(
-            "GSMtasks-Uebertragung %s: Status %s, %s erfolgreich, %s nicht erfolgreich",
+            "GSMtasks-Uebertragung %s: Status %s, %s erfolgreich, %s nicht erfolgreich, Fahrer %s (%s)",
             delivery_date, batch["status"], batch["success_count"], batch["failure_count"],
+            assignee.name, assignee.user_id,
         )
         return jsonify(batch)
 

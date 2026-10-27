@@ -8,6 +8,8 @@ import requests
 
 from routeplanning.gsmtasks import (
     BASE_URL,
+    Assignee,
+    AssigneeConfigError,
     DropoffTask,
     GSMtasksClient,
     GSMtasksError,
@@ -17,12 +19,16 @@ from routeplanning.gsmtasks import (
     build_description,
     build_external_id,
     build_order_payload,
+    load_assignee,
     load_env,
     missing_address_parts,
 )
 
 API_KEY = "test-key-123"
 ACCOUNT_URL = "https://api.gsmtasks.com/accounts/57deb9eb-fake/"
+DRIVER_ID = "b47e7f7c-6e71-436c-8305-e7a0b6b2e1f9"
+DRIVER_URL = f"https://api.gsmtasks.com/users/{DRIVER_ID}/"
+DRIVER = Assignee(user_id=DRIVER_ID, name="Kressemann")
 
 
 def _client(status_code=200, side_effect=None):
@@ -51,6 +57,7 @@ def _task(**overrides):
         address_parts=dict(ADDRESS_PARTS),
         position=100,
         delivery_date="2026-08-20",
+        assignee_url=DRIVER_URL,
     )
     defaults.update(overrides)
     return DropoffTask(**defaults)
@@ -226,7 +233,7 @@ def test_order_payload_structure_for_one_stop():
     task_data = payload["tasks_data"][0]
     assert set(task_data) == {
         "external_id", "category", "contact", "address", "position",
-        "complete_after", "complete_before", "auto_assign",
+        "complete_after", "complete_before", "assignee", "auto_assign",
     }
     assert task_data["complete_after"] == "2026-08-20T00:00:00+02:00"
     assert task_data["complete_before"] == "2026-08-20T23:59:59+02:00"
@@ -238,11 +245,138 @@ def test_order_payload_structure_for_one_stop():
     assert task_data["contact"] == {"name": "Kunde A"}
 
 
-def test_order_payload_never_assigns_a_driver():
+def test_order_payload_assigns_configured_driver_without_auto_assign():
     payload = build_order_payload(_task(), ACCOUNT_URL)
     task_data = payload["tasks_data"][0]
-    assert "assignee" not in task_data and "assignee" not in payload
+    # Fahrer nur am Task (User-URL), am Order gibt es das Feld nicht mehr.
+    assert task_data["assignee"] == DRIVER_URL
+    assert "assignee" not in payload
     assert payload["auto_assign"] is False and task_data["auto_assign"] is False
+
+
+def test_assignee_user_url_format():
+    assert DRIVER.user_url == DRIVER_URL
+
+
+@pytest.mark.parametrize("assignee_url", ["", None])
+def test_order_payload_without_driver_raises(assignee_url):
+    with pytest.raises(AssigneeConfigError):
+        build_order_payload(_task(assignee_url=assignee_url), ACCOUNT_URL)
+
+
+def test_create_dropoff_order_without_driver_sends_nothing():
+    session = Mock()
+    client = GSMtasksClient(api_key=API_KEY, session=session)
+    with pytest.raises(AssigneeConfigError):
+        client.create_dropoff_order(_task(assignee_url=""), ACCOUNT_URL)
+    session.post.assert_not_called()
+
+
+# -- Fahrerzuordnung: Konfiguration und lesende Pruefung ------------------
+
+
+def test_load_assignee_from_env():
+    assignee = load_assignee({
+        "GSMTASKS_ASSIGNEE_USER_ID": f"  {DRIVER_ID.upper()} ",
+        "GSMTASKS_ASSIGNEE_NAME": " Kressemann ",
+    })
+    assert assignee == DRIVER
+
+
+@pytest.mark.parametrize("env", [
+    {},
+    {"GSMTASKS_ASSIGNEE_NAME": "Kressemann"},
+    {"GSMTASKS_ASSIGNEE_USER_ID": DRIVER_ID},
+    {"GSMTASKS_ASSIGNEE_USER_ID": " ", "GSMTASKS_ASSIGNEE_NAME": "Kressemann"},
+])
+def test_load_assignee_missing_config_raises(env):
+    with pytest.raises(AssigneeConfigError, match="nicht konfiguriert"):
+        load_assignee(env)
+
+
+@pytest.mark.parametrize("bad_id", ["Kressemann", "123", DRIVER_URL, DRIVER_ID + "x"])
+def test_load_assignee_invalid_id_raises(bad_id):
+    with pytest.raises(AssigneeConfigError, match="keine gueltige"):
+        load_assignee({"GSMTASKS_ASSIGNEE_USER_ID": bad_id, "GSMTASKS_ASSIGNEE_NAME": "Kressemann"})
+
+
+def test_load_env_reads_assignee_from_environment(tmp_path, monkeypatch):
+    monkeypatch.setenv("GSMTASKS_ASSIGNEE_USER_ID", DRIVER_ID)
+    monkeypatch.setenv("GSMTASKS_ASSIGNEE_NAME", "Kressemann")
+    assert load_assignee(load_env(tmp_path / "missing.env")) == DRIVER
+
+
+def _role(**overrides):
+    role = {
+        "id": "1ad1eaa3-73ff-414b-9a40-5798d284e62b",
+        "user": DRIVER_URL,
+        "display_name": "Kressemann",
+        "is_worker": True,
+        "is_active": True,
+        "state": "active",
+        "deleted_at": None,
+    }
+    role.update(overrides)
+    return role
+
+
+def _roles_client(status_code=200, roles=None):
+    session = Mock()
+    session.get.return_value = Mock(status_code=status_code, json=lambda: roles if roles is not None else [_role()])
+    return GSMtasksClient(api_key=API_KEY, session=session), session
+
+
+def test_verify_assignee_accepts_unique_active_driver_read_only():
+    client, session = _roles_client()
+    assert client.verify_assignee(DRIVER) == DRIVER
+    session.get.assert_called_once()
+    assert session.get.call_args.args[0] == f"{BASE_URL}/account_roles/"
+    assert session.get.call_args.kwargs["params"] == {"user": DRIVER_ID}
+    session.post.assert_not_called()
+    session.patch.assert_not_called()
+    session.put.assert_not_called()
+
+
+def test_verify_assignee_accepts_paginated_results():
+    client, _ = _roles_client(roles={"results": [_role()]})
+    assert client.verify_assignee(DRIVER) == DRIVER
+
+
+@pytest.mark.parametrize("roles, match", [
+    ([], "nicht eindeutig: 0"),
+    ([_role(), _role(id="other")], "nicht eindeutig: 2"),
+    # Filter ignoriert -> fremde Rollen (Integrations-Benutzer "Kressemann") zaehlen nicht.
+    ([_role(user="https://api.gsmtasks.com/users/a509cbe4-5c88-4ce1-b78b-2f9c192a0160/")], "nicht eindeutig: 0"),
+    ([_role(deleted_at="2026-10-01T00:00:00Z")], "nicht eindeutig: 0"),
+    ([_role(is_worker=False)], "kein aktiver Fahrer"),
+    ([_role(is_active=False)], "kein aktiver Fahrer"),
+    ([_role(state="inactive")], "kein aktiver Fahrer"),
+    ([_role(display_name="Anderer Fahrer")], "konfiguriert ist 'Kressemann'"),
+])
+def test_verify_assignee_rejects_invalid_or_ambiguous_driver(roles, match):
+    client, session = _roles_client(roles=roles)
+    with pytest.raises(AssigneeConfigError, match=match):
+        client.verify_assignee(DRIVER)
+    session.post.assert_not_called()
+
+
+def test_verify_assignee_unknown_user_id_is_config_error():
+    # GSMtasks antwortet auf unbekannte UUIDs im Filter mit 400.
+    client, _ = _roles_client(status_code=400, roles={"user": ["Select a valid choice."]})
+    with pytest.raises(AssigneeConfigError, match="unbekannt"):
+        client.verify_assignee(DRIVER)
+
+
+def test_verify_assignee_http_and_network_errors_do_not_leak_key():
+    client, _ = _roles_client(status_code=401)
+    with pytest.raises(GSMtasksError) as exc_info:
+        client.verify_assignee(DRIVER)
+    assert API_KEY not in str(exc_info.value)
+
+    client, _ = _client(side_effect=requests.ConnectionError(f"boom {API_KEY}"))
+    with pytest.raises(GSMtasksError) as exc_info:
+        client.verify_assignee(DRIVER)
+    assert API_KEY not in str(exc_info.value)
 
 
 def test_order_payload_structured_address_without_attention_line():
@@ -565,8 +699,8 @@ def test_payload_window_follows_task_delivery_date():
     task_data = payload["tasks_data"][0]
     assert (task_data["complete_after"], task_data["complete_before"]) == (
         "2026-10-25T00:00:00+02:00", "2026-10-25T23:59:59+01:00")
-    # Unveraendert: keine Fahrerzuweisung, auto_assign aus, strukturierte Adresse.
-    assert "assignee" not in task_data and task_data["auto_assign"] is False and payload["auto_assign"] is False
+    # Fester Fahrer, auto_assign aus, strukturierte Adresse.
+    assert task_data["assignee"] == DRIVER_URL and task_data["auto_assign"] is False and payload["auto_assign"] is False
     assert task_data["address"]["street"] == "Kleiner Platz 9-13"
 
 

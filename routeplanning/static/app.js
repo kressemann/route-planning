@@ -37,6 +37,7 @@ const el = {
   gsmtasksModalKisten: document.getElementById("gsmtasks-modal-kisten"),
   gsmtasksModalSchnittware: document.getElementById("gsmtasks-modal-schnittware"),
   gsmtasksModalKresse: document.getElementById("gsmtasks-modal-kresse"),
+  gsmtasksModalAssignee: document.getElementById("gsmtasks-modal-assignee"),
   btnGsmtasksCancel: document.getElementById("btn-gsmtasks-cancel"),
   btnGsmtasksConfirm: document.getElementById("btn-gsmtasks-confirm"),
 };
@@ -455,6 +456,7 @@ async function openGsmtasksModal() {
   el.gsmtasksModalKisten.textContent = RouteTotals.formatNumber(totals.kisten);
   el.gsmtasksModalSchnittware.textContent = RouteTotals.formatNumber(totals.schnittware);
   el.gsmtasksModalKresse.textContent = RouteTotals.formatNumber(totals.kresse);
+  el.gsmtasksModalAssignee.textContent = "wird geprüft …";
   el.gsmtasksResults.hidden = true;
   el.gsmtasksConfirmManual.checked = false;
   state.precheckReady = false;
@@ -465,8 +467,12 @@ async function openGsmtasksModal() {
   try {
     const result = await apiFetch(`/api/draft/${state.date}/gsmtasks/precheck`);
     renderPrecheck(result);
-    state.precheckReady = Boolean(result.ready);
+    // Ohne vom Server bestaetigten Fahrer keine Uebertragung.
+    const assigneeName = result.assignee && result.assignee.name;
+    el.gsmtasksModalAssignee.textContent = assigneeName || "nicht ermittelt";
+    state.precheckReady = Boolean(result.ready && assigneeName);
   } catch (err) {
+    el.gsmtasksModalAssignee.textContent = "nicht ermittelt";
     el.gsmtasksPrecheck.classList.add("error");
     el.gsmtasksPrecheck.textContent = `Vorabprüfung fehlgeschlagen – es wird nichts übertragen. ${err.message}`;
     state.precheckReady = false;
