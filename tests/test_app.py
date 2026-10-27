@@ -185,6 +185,51 @@ def test_profile_save_and_apply(client):
     assert profiles == ["Route1"]
 
 
+@pytest.mark.parametrize(
+    "name",
+    [
+        "Dienstag MA/HD",  # Regression 27.10.2026: "/" im Namen ergab 404
+        "Mo/Di/Mi",
+        "A//B",
+        "Süd-Tour Größe ÄÖÜ",
+        "Tour 50% & mehr?#",
+    ],
+)
+def test_profile_apply_with_special_characters_in_name(client, name):
+    from urllib.parse import quote
+
+    client.post("/api/tour/load", json={"date": "2026-08-20"})
+    # Profil mit Reihenfolge c1, c2 speichern und eine Fassung mit gleichem
+    # Praefix anlegen, damit eine Verwechslung auffallen wuerde.
+    assert client.post("/api/profiles", json={"name": name, "date": "2026-08-20"}).status_code == 200
+    client.put(
+        "/api/draft/2026-08-20",
+        json={
+            "stops": [
+                {"customer_id": "c2", "kisten": 0, "schnittware": 0, "kresse": 2},
+                {"customer_id": "c1", "kisten": 1, "schnittware": 0, "kresse": 0},
+            ]
+        },
+    )
+    assert client.post("/api/profiles", json={"name": name.split("/")[0] + "X", "date": "2026-08-20"}).status_code == 200
+
+    # Gleiche Kodierung wie das Frontend (encodeURIComponent).
+    resp = client.post(
+        f"/api/profiles/{quote(name, safe='')}/apply", json={"date": "2026-08-20"}
+    )
+    assert resp.status_code == 200, resp.get_data(as_text=True)
+    stops = resp.get_json()["stops"]
+    assert [s["customer_id"] for s in stops] == ["c1", "c2"]
+    assert not any(s["not_in_profile"] for s in stops)
+
+
+def test_profile_apply_unknown_name_with_slash_is_json_error(client):
+    client.post("/api/tour/load", json={"date": "2026-08-20"})
+    resp = client.post("/api/profiles/Gibt%2FEs%20nicht/apply", json={"date": "2026-08-20"})
+    assert resp.status_code == 400
+    assert "nicht gefunden" in resp.get_json()["error"]
+
+
 def test_delete_stop_removes_it_from_draft(client):
     client.post("/api/tour/load", json={"date": "2026-08-20"})
     resp = client.delete("/api/draft/2026-08-20/stops/c1")

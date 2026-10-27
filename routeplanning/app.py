@@ -379,7 +379,11 @@ def create_app(
         db.save_profile(conn, name, customer_ids)
         return jsonify({"name": name, "customer_ids": customer_ids})
 
-    @app.post("/api/profiles/<name>/apply")
+    # Profilnamen duerfen "/" enthalten (z. B. "Dienstag MA/HD"). Das Frontend
+    # kodiert ihn als %2F, der WSGI-Server dekodiert PATH_INFO aber vor dem
+    # Routing wieder zu "/" - deshalb "path:" statt des Standard-Converters,
+    # und merge_slashes=False, damit "A//B" nicht zu "A/B" umgeschrieben wird.
+    @app.post("/api/profiles/<path:name>/apply", merge_slashes=False)
     @handle_errors
     def apply_profile(name: str) -> Response:
         payload = request.get_json(silent=True) or {}
